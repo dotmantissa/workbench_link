@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workbench-link"
+version = "0.1.0"
+description = "A native Hermes execution environment for one explicitly selected project worker"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "dotmantissa", email = "negativemantissa@gmail.com"}]
+dependencies = []
+
+[project.scripts]
+workbench-link-worker = "workbench_link.worker:main"
+
+[tool.setuptools]
+packages = ["workbench_link"]
