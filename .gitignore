@@ -1,0 +1,20 @@
+research/sources/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.env
+.env.*
+!.env.example
+
+# Disposable development runtime and private test state
+dev/hermes/
+dev/runtime/
+.runtime/
+*.tmp
