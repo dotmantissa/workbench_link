@@ -1,6 +1,6 @@
 # Installation, commands and recovery specification
 
-Commands here are intended interfaces; they are not runnable until implemented. No frontend is required. Prefer a few explicit commands to a wizard with hidden backend changes.
+This document preserves the broader intended interfaces. The implemented November 10 checkpoint uses `serve`, `bind`, `status`, `doctor` and `/workbench-link`; exact runnable setup is in [README.md](../README.md). Other commands below remain planned. No frontend is required.
 
 ## 1. Host setup
 

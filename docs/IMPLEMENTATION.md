@@ -1,6 +1,6 @@
 # Ordered implementation checklist
 
-Execute in dependency order. Each item states what to build and the evidence needed to mark it complete in the ignored root TASKS.md. Architecture preparation has not completed any runtime item here. Estimated effort is provisional; availability is unknown.
+Execute in dependency order. Each item states what to build and the evidence needed to mark it complete in the ignored root TASKS.md. The November 10 foreground checkpoint has real broker/worker, native routing and fault evidence in [RUNTIME_EVIDENCE.md](RUNTIME_EVIDENCE.md). Phase 0's full exit remains open because persistent `execute_code` and background lifecycle are unsupported. Estimated effort is provisional; availability is unknown.
 
 ## Phase 0 — establish the native premise (first focused checkpoint)
 

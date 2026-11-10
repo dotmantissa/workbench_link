@@ -1,0 +1,36 @@
+name: workbench-link
+version: "0.1.0"
+description: Route native Hermes terminal and file tools to one selected project worker.
+author: dotmantissa
+kind: backend
+requires_hermes: ">=0.23.0,<0.24.0"
+license: MIT
+homepage: https://github.com/dotmantissa/workbench_link
+provides_hooks:
+  - pre_tool_call
+config_schema:
+  worker_id:
+    type: str
+    default: local-dev
+    description: Stable identity of the explicitly selected worker.
+  project_alias:
+    type: str
+    default: project
+    description: Display name for the selected project.
+  control_dir:
+    type: str
+    default: ""
+    description: Optional shorter absolute private broker directory for Unix socket limits.
+  timeout:
+    type: int
+    default: 120
+  memory_mb:
+    type: int
+    default: 512
+  cpus:
+    type: int
+    default: 1
+  token:
+    type: secret
+    env: WORKBENCH_LINK_TOKEN
+    description: Shared lowercase hexadecimal worker key (32–128 bytes).

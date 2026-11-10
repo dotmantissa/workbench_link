@@ -1,6 +1,6 @@
 # Hermes compatibility: evidence and integration gates
 
-Baseline inspected: released tag **v0.23.0**, published November 5, 2026. Source inspection is not a runtime result. The implementation spike must resolve each row below through actual discovery and native calls.
+Baseline inspected: released tag **v0.23.0**, published November 5, 2026. The November 10 [runtime evidence](RUNTIME_EVIDENCE.md) now proves native foreground/file routing, approvals and disconnected refusal. Persistent `execute_code` and background/concurrent RPC remain a demonstrated unresolved contract. Rows below preserve the complete integration targets.
 
 | Surface | Source-verified behavior | Implementation consequence |
 |---|---|---|
