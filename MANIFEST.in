@@ -1,0 +1,5 @@
+include README.md LICENSE pyproject.toml plugin.yaml __init__.py Dockerfile .dockerignore
+include .editorconfig .github/CONTRIBUTING.md .github/workflows/ci.yml
+recursive-include docs *.md
+recursive-include tests *.py
+global-exclude *.py[cod]

@@ -6,10 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "workbench-link"
 version = "0.1.0"
 description = "A native Hermes execution environment for one explicitly selected project worker"
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{name = "dotmantissa", email = "negativemantissa@gmail.com"}]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/dotmantissa/workbench_link"
+Repository = "https://github.com/dotmantissa/workbench_link"
+Issues = "https://github.com/dotmantissa/workbench_link/issues"
 
 [project.scripts]
 workbench-link-worker = "workbench_link.worker:main"

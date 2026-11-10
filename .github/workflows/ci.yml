@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit and socket tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests/unit -v
+      - name: Build and install wheel
+        run: |
+          python -m pip wheel --no-deps --wheel-dir dist .
+          python -m pip install --no-deps dist/*.whl
+          python -m pip check
+      - name: Check installed worker outside checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -I -c "import workbench_link.worker, workbench_link.broker, workbench_link.runner"
+          workbench-link-worker --help
+
+  docker:
+    name: Docker integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14'
+      - name: Build worker image
+        run: docker build -t workbench-link-worker:ci .
+      - name: Worker smoke tests
+        run: |
+          WBL_IMAGE_ID="$(docker image inspect workbench-link-worker:ci --format '{{.Id}}')"
+          python tests/integration/worker_smoke.py --image "$WBL_IMAGE_ID"
+      - name: Worker fault tests
+        run: |
+          WBL_IMAGE_ID="$(docker image inspect workbench-link-worker:ci --format '{{.Id}}')"
+          python tests/integration/worker_faults.py --image "$WBL_IMAGE_ID"
