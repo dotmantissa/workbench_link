@@ -1,9 +1,12 @@
 """Explicit local Docker topology test; run with --image <inspected image ID>."""
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import subprocess
+import socket
 import sys
 import tempfile
 import threading
@@ -14,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from workbench_link import control, protocol as p
-from workbench_link.broker import Broker
+from workbench_link.broker import Broker, WorkerHandler
+from workbench_link.cli import setup_parser, run_cli
 from workbench_link.ledger import new_id
 from workbench_link.settings import Settings
 from workbench_link.worker import Worker
@@ -82,8 +86,36 @@ def main():
             # Repeated delivery observes the same receipt, with no second marker effect.
             control.request(root / 'broker', 'submit', envelope=envelope)
             assert len(broker.ledger.status()['operations']) == 1
+            # Drop the actual HTTP acknowledgement after the broker commits a
+            # terminal receipt. Recovery must upload the same receipt, not run again.
+            dropped = threading.Event()
+            class DropResultAck(WorkerHandler):
+                def reply(self, code, obj):
+                    if self.path == '/v1/worker/result' and not dropped.is_set():
+                        dropped.set()
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.close_connection = True
+                        return
+                    super().reply(code, obj)
+            broker.http.RequestHandlerClass = DropResultAck
+            second = dict(envelope, operation_id=new_id(), script='printf x >> counter.txt', stdin_b64='')
+            second['payload_sha256'] = p.payload_hash(second)
+            control.request(root / 'broker', 'submit', envelope=second)
+            wait_until(lambda: (worker.store.get('operation', second['operation_id']) or {}).get('state') == 'ACKNOWLEDGED', 25)
+            assert dropped.is_set() and (project / 'counter.txt').read_bytes() == b'x'
+            wait_until(lambda: broker.ledger.status()['environments'][0]['stop_evidence'])
+            parser = argparse.ArgumentParser(); setup_parser(parser)
+            for arguments in (['inspect', second['operation_id'], '--json'], ['recover', '--json'],
+                              ['stop', '--json'], ['reset', '--json'], ['doctor', '--json']):
+                with contextlib.redirect_stdout(io.StringIO()) as capture:
+                    code = run_cli(parser.parse_args(arguments), broker.settings, '')
+                result = json.loads(capture.getvalue())
+                assert code == 0 and result['ok'], (arguments, code, result)
+            assert broker.ledger.status()['binding']['generation'] == 2
+            assert not errors, errors
             print(json.dumps({'ok': True, 'output_exact': True, 'selected_mount_only': True,
-                              'no_container_key': True, 'duplicate_grant_effects': 1, 'image': args.image}))
+                              'no_container_key': True, 'duplicate_grant_effects': 1,
+                              'lost_receipt_ack_effects': 1, 'operator_recovery_verified': True, 'image': args.image}))
         finally:
             worker.stop_event.set(); thread.join(6)
             worker.close(); broker.close()

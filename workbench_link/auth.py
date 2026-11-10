@@ -9,7 +9,7 @@ from .errors import Code, LinkError
 from .protocol import VERSION, digest, identifier, slug
 
 PATHS = frozenset("/v1/worker/" + p for p in
-                  ("hello", "heartbeat", "poll", "accept", "running", "output", "result", "recover"))
+                  ("hello", "heartbeat", "poll", "accept", "running", "output", "result", "recover", "environment_stopped"))
 HEADERS = ("X-WBL-Version", "X-WBL-Worker", "X-WBL-Instance", "X-WBL-Time",
            "X-WBL-Nonce", "X-WBL-Body-SHA256", "X-WBL-Signature")
 

@@ -168,6 +168,103 @@ class LedgerTests(unittest.TestCase):
             self.ledger.result(self.instance, self.receipt(e, grant, b'x'))
         self.assertEqual(self.ledger.operation(e['operation_id'])['state'], 'START_GRANTED')
 
+    def session_envelope(self):
+        e = dict(self.envelope(), lifecycle='session')
+        e['payload_sha256'] = p.payload_hash(e)
+        return e
+
+    def stop_evidence(self):
+        return {name: self.env[name] for name in ('environment_id', 'binding_id', 'generation')} | {
+            'termination_confirmed': True, 'termination_method': 'container_stop'}
+
+    def test_completed_session_is_fenced_after_disconnect_until_explicit_reset(self):
+        e = self.session_envelope(); grant = self.grant(e)
+        inventory = [{'pid': 32, 'start_ticks': 999}]
+        receipt = self.receipt(e, grant, termination_scope='foreground', detached_processes=inventory)
+        self.ledger.result(self.instance, receipt)
+        self.assertEqual(self.ledger.status()['environments'][0]['inventory'], inventory)
+        self.ledger.disconnect(self.instance)
+        self.assertEqual(self.ledger.operation(e['operation_id'])['state'], 'COMPLETED')
+        self.assertEqual(self.ledger.status()['binding']['state'], 'FENCED')
+        with self.assertRaises(LinkError):
+            self.ledger.reset()
+        self.ledger.environment_stopped(self.instance, self.stop_evidence())
+        self.assertEqual(self.ledger.status()['binding']['state'], 'FENCED')
+        renewed = self.ledger.reset()
+        self.assertEqual(renewed['binding']['generation'], 2)
+        self.assertEqual(renewed['binding']['state'], 'ACTIVE')
+        with self.assertRaises(LinkError):
+            self.ledger.submit(self.session_envelope())
+
+    def test_session_restart_preserves_stop_gate_and_human_unknown_history(self):
+        e = self.session_envelope(); self.grant(e)
+        self.ledger.recover_startup()
+        with self.assertRaises(LinkError):
+            self.ledger.resolve_unknown(e['operation_id'], 'Inspected local changes', e['operation_id'])
+        with self.assertRaises(LinkError):
+            self.ledger.environment_stopped(new_id(), self.stop_evidence())
+        self.ledger.environment_stopped(self.instance, self.stop_evidence())
+        with self.assertRaises(LinkError):
+            self.ledger.resolve_unknown(e['operation_id'], 'Inspected local changes', 'wrong')
+        resolved = self.ledger.resolve_unknown(e['operation_id'], 'Inspected local changes', e['operation_id'])
+        self.assertEqual(resolved['state'], 'RESOLVED_UNKNOWN')
+        self.assertIsNone(resolved['receipt'])
+        self.assertEqual(self.ledger.status()['binding']['state'], 'FENCED')
+        self.ledger.reset()
+        self.assertEqual(self.ledger.operation(e['operation_id'])['state'], 'RESOLVED_UNKNOWN')
+
+    def test_foreground_receipt_cannot_weaken_operation_termination(self):
+        e = self.envelope(); grant = self.grant(e)
+        with self.assertRaises(LinkError):
+            self.ledger.result(self.instance, self.receipt(e, grant,
+                termination_scope='foreground', detached_processes=[]))
+        self.assertEqual(self.ledger.operation(e['operation_id'])['state'], 'START_GRANTED')
+        with self.assertRaises(LinkError):
+            p.receipt(self.receipt(e, grant, detached_processes=[{'pid': 2, 'start_ticks': 1}]))
+
+    def test_close_waits_for_stop_evidence_after_successful_session_launch(self):
+        e = self.session_envelope(); grant = self.grant(e)
+        self.ledger.result(self.instance, self.receipt(e, grant, termination_scope='foreground', detached_processes=[]))
+        result = self.ledger.close_environment(self.env['environment_id'])
+        self.assertFalse(result['termination_confirmed'])
+        with self.assertRaises(LinkError):
+            self.ledger.open_environment()
+        self.ledger.environment_stopped(self.instance, self.stop_evidence())
+        self.assertTrue(self.ledger.close_environment(self.env['environment_id'])['termination_confirmed'])
+        self.assertNotEqual(self.ledger.open_environment()['environment_id'], self.env['environment_id'])
+
+    def test_disconnect_before_grant_revokes_queue_without_silent_reconnect_launch(self):
+        e = self.envelope(); self.ledger.submit(e)
+        self.ledger.disconnect(self.instance)
+        self.assertEqual(self.ledger.operation(e['operation_id'])['state'], 'NOT_STARTED')
+        self.assertIsNone(self.ledger.poll(self.instance)['envelope'])
+        with self.assertRaises(LinkError):
+            self.ledger.accept(self.instance, e['operation_id'], e['payload_sha256'])
+
+    def test_schema_one_migration_keeps_receipts_output_and_unresolved_grants(self):
+        completed = self.envelope(); grant = self.grant(completed)
+        output = b'historical output\x00\xff'
+        self.upload(completed, output)
+        receipt = self.receipt(completed, grant, output)
+        self.ledger.result(self.instance, receipt)
+        pending = self.envelope(); self.grant(pending)
+        profile_id = self.store.profile_id
+        # Recreate the released schema-1 environment shape with real history.
+        for column in ('session_owned', 'inventory_json', 'stop_json'):
+            self.store.db.execute(f'ALTER TABLE environments DROP COLUMN {column}')
+        self.store.db.execute('PRAGMA user_version=1')
+        self.store.close()
+        self.store = Store(Path(self.temp.name))
+        self.ledger = Ledger(self.store)
+        self.ledger.recover_startup()
+        self.assertEqual(self.store.profile_id, profile_id)
+        self.assertEqual(self.ledger.operation(completed['operation_id'])['receipt'], receipt)
+        self.assertEqual(self.ledger.read_output(completed['operation_id']), output)
+        self.assertEqual(self.ledger.operation(pending['operation_id'])['state'], 'UNKNOWN')
+        self.assertEqual(self.ledger.status()['binding']['state'], 'FENCED')
+        with self.assertRaises(LinkError):
+            self.ledger.open_environment()
+
 
 if __name__ == '__main__':
     unittest.main()

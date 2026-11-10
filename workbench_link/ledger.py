@@ -49,18 +49,25 @@ class Ledger:
                 byte_offset INTEGER NOT NULL, byte_count INTEGER NOT NULL,
                 digest TEXT NOT NULL, spool_ref TEXT NOT NULL,
                 PRIMARY KEY(operation_id,sequence))''')
+            columns = {row['name'] for row in self.db.execute('PRAGMA table_info(environments)')}
+            for name, definition in (('session_owned', 'INTEGER NOT NULL DEFAULT 0'),
+                                     ('inventory_json', "BLOB NOT NULL DEFAULT '[]'"),
+                                     ('stop_json', 'BLOB')):
+                if name not in columns:
+                    self.db.execute(f'ALTER TABLE environments ADD COLUMN {name} {definition}')
 
     def _one(self, query, args=()):
         row = self.db.execute(query, args).fetchone()
         return dict(row) if row else None
 
     def _binding(self, binding_id=None):
-        query = '''SELECT b.*,r.worker_id,r.project_id,r.alias,r.image
+        query = '''SELECT b.*,r.worker_id,r.project_id,r.alias,r.image,r.capability_json
                    FROM bindings b JOIN registrations r ON b.instance_id=r.instance_id'''
         row = self._one(query + (' WHERE binding_id=?' if binding_id else
                                 ' ORDER BY generation DESC LIMIT 1'), (binding_id,) if binding_id else ())
         if row is None:
             raise LinkError(Code.WORKER_UNAVAILABLE, 'No accepted project. Start a worker, then bind its exact identity.')
+        row['capabilities'] = p.decode(row.pop('capability_json'))
         return row
 
     def _active(self, binding_id):
@@ -119,7 +126,7 @@ class Ledger:
                 if previous['instance_id'] == instance_id:
                     return self._binding(previous['binding_id'])
                 if previous['state'] == 'FENCED' or self.db.execute(
-                        "SELECT 1 FROM environments WHERE binding_id=? AND state='OPEN'", (previous['binding_id'],)).fetchone():
+                        "SELECT 1 FROM environments WHERE binding_id=? AND state IN ('OPEN','CLOSING')", (previous['binding_id'],)).fetchone():
                     raise LinkError(Code.WORKSPACE_BUSY, 'Close and reconcile the previous environment before replacing its binding.')
                 self.db.execute("UPDATE bindings SET state='CLOSED' WHERE binding_id=?", (previous['binding_id'],))
             binding_id = new_id()
@@ -132,10 +139,10 @@ class Ledger:
         with self.store.transaction():
             binding = self._binding()
             self._active(binding['binding_id'])
-            if self.db.execute("SELECT 1 FROM environments WHERE state='OPEN'").fetchone():
+            if self.db.execute("SELECT 1 FROM environments WHERE state IN ('OPEN','CLOSING')").fetchone():
                 raise LinkError(Code.WORKSPACE_BUSY, 'One native environment is already open for this profile.')
             environment_id = new_id()
-            self.db.execute("INSERT INTO environments VALUES(?,?,'OPEN')", (environment_id, binding['binding_id']))
+            self.db.execute("INSERT INTO environments(environment_id,binding_id,state) VALUES(?,?,'OPEN')", (environment_id, binding['binding_id']))
             return dict(binding, profile_id=self.store.profile_id, environment_id=environment_id)
 
     def submit(self, envelope):
@@ -203,6 +210,10 @@ class Ledger:
                         return {'ok': True, 'start_grant_id': op['grant_id'], 'launch_seconds': max(0, op['grant_deadline'] - time.time())}
                 elif op['state'] == 'QUEUED':
                     grant = new_id()
+                    envelope = p.decode(self.store.read(op['payload_ref']))
+                    if envelope.get('lifecycle') == 'session':
+                        self.db.execute('UPDATE environments SET session_owned=1 WHERE environment_id=?',
+                                        (op['environment_id'],))
                     self.db.execute("UPDATE operations SET state='START_GRANTED',grant_id=?,grant_deadline=?,updated=? WHERE operation_id=?",
                                     (grant, time.time() + 5, time.time(), operation_id))
                     self.store.event(operation_id, 'START_GRANTED', {'grant_id': grant})
@@ -279,6 +290,11 @@ class Ledger:
                 elif receipt['output_bytes'] != op['output_bytes'] or receipt['last_sequence'] != op['next_sequence'] - 1:
                     raise LinkError(Code.BAD_REQUEST, 'Upload all contiguous output before its receipt.', op['operation_id'])
                 else:
+                    envelope = p.decode(self.store.read(op['payload_ref']))
+                    if receipt.get('termination_scope', 'environment') == 'foreground' and envelope.get('lifecycle') != 'session':
+                        raise LinkError(Code.INTEGRITY_FAILURE, 'Operation termination cannot be reduced to foreground scope.', op['operation_id'])
+                    if envelope.get('lifecycle') == 'session' and 'termination_scope' not in receipt:
+                        raise LinkError(Code.INTEGRITY_FAILURE, 'Session receipt must declare its termination scope.', op['operation_id'])
                     try:
                         if p.digest(self._read_output(op['operation_id'], maximum=p.OUTPUT_LIMIT)) != receipt['output_sha256']:
                             error = Code.INTEGRITY_FAILURE
@@ -289,6 +305,9 @@ class Ledger:
                     self.db.execute('UPDATE operations SET state=?,receipt_json=?,updated=? WHERE operation_id=?',
                                     (state, encoded, time.time(), op['operation_id']))
                     self.store.event(op['operation_id'], state, {'exit_code': receipt['exit_code']})
+                    if receipt.get('termination_scope') == 'foreground':
+                        self.db.execute('UPDATE environments SET inventory_json=? WHERE environment_id=? AND stop_json IS NULL',
+                                        (p.canonical(receipt['detached_processes']), op['environment_id']))
                     if not receipt['output_complete']:
                         self._fence(op['binding_id'], 'INCOMPLETE_OUTPUT', op['operation_id'])
             if error:
@@ -307,12 +326,15 @@ class Ledger:
             for sequence, row in enumerate(rows):
                 if row['sequence'] != sequence or row['byte_offset'] != expected:
                     raise LinkError(Code.INTEGRITY_FAILURE, 'Stored output is not contiguous.', operation_id)
+                start = expected
+                expected += row['byte_count']
+                if expected <= offset or start >= offset + maximum:
+                    continue
                 data = self.store.read(row['spool_ref'])
                 if len(data) != row['byte_count'] or p.digest(data) != row['digest']:
                     raise LinkError(Code.INTEGRITY_FAILURE, 'Stored output failed verification.', operation_id)
-                expected += len(data)
-                result.extend(data)
-            return bytes(result[offset:offset + maximum])
+                result.extend(data[max(0, offset - start):min(len(data), offset + maximum - start)])
+            return bytes(result)
 
     def read_output(self, operation_id, offset=0, maximum=p.CHUNK_LIMIT):
         error = None
@@ -355,14 +377,22 @@ class Ledger:
                 if row['grant_id']:
                     self._fence(row['binding_id'], 'BROKER_RESTART', row['operation_id'])
                 self.store.event(row['operation_id'], 'RECOVERED_' + state, {})
-            # A dead adapter cannot retain an environment lock after restart.
-            self.db.execute("UPDATE environments SET state='CLOSED'")
+            for env in self.db.execute("SELECT * FROM environments WHERE session_owned=1 AND state IN ('OPEN','CLOSING')").fetchall():
+                self._fence(env['binding_id'], 'SESSION_RESTART')
+                self.db.execute("UPDATE environments SET state='CLOSING' WHERE environment_id=?", (env['environment_id'],))
+            self.db.execute("UPDATE environments SET state='CLOSED' WHERE session_owned=0")
 
     def disconnect(self, instance_id):
         with self.store.transaction():
+            for row in self.db.execute("SELECT o.* FROM operations o JOIN bindings b ON o.binding_id=b.binding_id WHERE b.instance_id=? AND o.state='QUEUED' AND o.grant_id IS NULL", (instance_id,)).fetchall():
+                self.db.execute("UPDATE operations SET state='NOT_STARTED',cancel_requested=1 WHERE operation_id=?", (row['operation_id'],))
+                self.store.event(row['operation_id'], 'DISCONNECTED_NOT_STARTED', {})
             for row in self.db.execute("SELECT o.* FROM operations o JOIN bindings b ON o.binding_id=b.binding_id WHERE b.instance_id=? AND o.state IN ('START_GRANTED','RUNNING')", (instance_id,)).fetchall():
                 self.db.execute("UPDATE operations SET state='UNKNOWN',cancel_requested=1 WHERE operation_id=?", (row['operation_id'],))
                 self._fence(row['binding_id'], 'LEASE_EXPIRED', row['operation_id'])
+            for env in self.db.execute("SELECT e.* FROM environments e JOIN bindings b ON e.binding_id=b.binding_id WHERE b.instance_id=? AND e.session_owned=1 AND e.state IN ('OPEN','CLOSING')", (instance_id,)).fetchall():
+                self._fence(env['binding_id'], 'SESSION_LEASE_EXPIRED')
+                self.db.execute("UPDATE environments SET state='CLOSING' WHERE environment_id=?", (env['environment_id'],))
 
     def close_environment(self, environment_id):
         p.identifier(environment_id)
@@ -371,13 +401,83 @@ class Ledger:
         for row in active:
             self.cancel(row['operation_id'])
         with self.store.transaction():
-            self.db.execute("UPDATE environments SET state='CLOSED' WHERE environment_id=?", (environment_id,))
-        return {'ok': True}
+            env = self._one('SELECT * FROM environments WHERE environment_id=?', (environment_id,))
+            if not env:
+                p.bad('Unknown environment.')
+            state = 'CLOSING' if env['session_owned'] and not env['stop_json'] else 'CLOSED'
+            self.db.execute('UPDATE environments SET state=? WHERE environment_id=?', (state, environment_id))
+        return {'ok': True, 'environment_id': environment_id, 'state': state,
+                'termination_confirmed': bool(env['stop_json'])}
+
+    def closing_environments(self, instance):
+        with self.store.lock:
+            return [row[0] for row in self.db.execute("SELECT e.environment_id FROM environments e JOIN bindings b ON e.binding_id=b.binding_id WHERE b.instance_id=? AND e.state IN ('CLOSING','CLOSED') AND e.stop_json IS NULL", (instance,))]
+
+    def environment_stopped(self, instance, evidence):
+        p.fields(evidence, {'environment_id', 'binding_id', 'generation', 'termination_confirmed', 'termination_method'})
+        p.identifier(evidence['environment_id']); p.identifier(evidence['binding_id'])
+        p.integer(evidence['generation'], 'generation', 1)
+        if evidence['termination_confirmed'] is not True or evidence['termination_method'] != 'container_stop':
+            p.bad('Environment stop requires confirmed container termination.')
+        with self.store.transaction():
+            env = self._one('SELECT * FROM environments WHERE environment_id=?', (evidence['environment_id'],))
+            if not env or env['binding_id'] != evidence['binding_id']:
+                raise LinkError(Code.BINDING_STALE, 'Stop evidence belongs to another environment.')
+            binding = self._binding(env['binding_id'])
+            if (binding['instance_id'], binding['generation']) != (instance, evidence['generation']):
+                raise LinkError(Code.BINDING_STALE, 'Stop evidence belongs to another worker generation.')
+            encoded = p.canonical(evidence)
+            if env['stop_json'] and bytes(env['stop_json']) != encoded:
+                raise LinkError(Code.INTEGRITY_FAILURE, 'Conflicting environment stop evidence.')
+            self.db.execute("UPDATE environments SET state='CLOSED',stop_json=?,inventory_json=? WHERE environment_id=?", (encoded, p.canonical([]), env['environment_id']))
+            self.store.event(None, 'ENVIRONMENT_STOPPED', {'environment_id': env['environment_id']})
+        return {'ok': True, 'acknowledged': True}
+
+    def stop(self):
+        with self.store.lock:
+            environments = [row[0] for row in self.db.execute("SELECT environment_id FROM environments WHERE state IN ('OPEN','CLOSING')")]
+        for environment in environments:
+            self.close_environment(environment)
+        if environments:
+            with self.store.transaction():
+                self._fence(self._binding()['binding_id'], 'OPERATOR_STOP')
+        return self.status()
+
+    def resolve_unknown(self, operation_id, note, confirmation):
+        p.text(note, 'resolution note', 2048)
+        if not note.strip() or confirmation != operation_id:
+            p.bad('Human resolution requires a note and exact operation confirmation.')
+        with self.store.transaction():
+            op = self._op(operation_id)
+            env = self._one('SELECT * FROM environments WHERE environment_id=?', (op['environment_id'],))
+            if op['state'] != 'UNKNOWN' or not env['stop_json']:
+                raise LinkError(Code.OUTCOME_UNKNOWN, 'Resolve only an unknown operation after confirmed environment stop.', operation_id)
+            self.db.execute("UPDATE operations SET state='RESOLVED_UNKNOWN',updated=? WHERE operation_id=?", (time.time(), operation_id))
+            self.store.event(operation_id, 'HUMAN_RESOLVED_UNKNOWN', {'note': note, 'effects': 'remain unknown'})
+        return self.operation(operation_id)
+
+    def reset(self):
+        with self.store.transaction():
+            binding = self._binding()
+            unresolved = self.db.execute("SELECT 1 FROM operations WHERE binding_id=? AND state NOT IN ('COMPLETED','CANCELLED','NOT_STARTED','RESOLVED_UNKNOWN')", (binding['binding_id'],)).fetchone()
+            live = self.db.execute("SELECT 1 FROM environments WHERE binding_id=? AND (state IN ('OPEN','CLOSING') OR (session_owned=1 AND stop_json IS NULL))", (binding['binding_id'],)).fetchone()
+            if unresolved or live:
+                raise LinkError(Code.OUTCOME_UNKNOWN, 'Stop environments and reconcile or resolve unknown operations before reset.')
+            self.db.execute("UPDATE bindings SET state='CLOSED' WHERE binding_id=?", (binding['binding_id'],))
+            identifier = new_id()
+            self.db.execute("INSERT INTO bindings VALUES(?,?,?,'ACTIVE',NULL)", (identifier, binding['generation'] + 1, binding['instance_id']))
+            self.store.event(None, 'RESET', {'closed_binding': binding['binding_id'], 'binding_id': identifier})
+        return self.status()
 
     def status(self):
         with self.store.lock:
             registrations = [dict(row) for row in self.db.execute('SELECT instance_id,worker_id,project_id,alias,image FROM registrations')]
             latest = self._one('SELECT binding_id FROM bindings ORDER BY generation DESC LIMIT 1')
             return {'ok': True, 'profile_id': self.store.profile_id, 'registrations': registrations,
+                    'unresolved_count': self.db.execute("SELECT COUNT(*) FROM operations WHERE state NOT IN ('COMPLETED','CANCELLED','NOT_STARTED','RESOLVED_UNKNOWN')").fetchone()[0],
+                    'closing_count': self.db.execute("SELECT COUNT(*) FROM environments WHERE state='CLOSING'").fetchone()[0],
                     'binding': self._binding(latest['binding_id']) if latest else None,
+                    'environments': [dict({name: row[name] for name in ('environment_id', 'binding_id', 'state', 'session_owned')}, inventory=p.decode(b'{"items":' + bytes(row['inventory_json']) + b'}')['items'],
+                        stop_evidence=p.decode(row['stop_json']) if row['stop_json'] else None)
+                        for row in self.db.execute('SELECT environment_id,binding_id,state,session_owned,CAST(inventory_json AS BLOB) AS inventory_json,stop_json FROM environments ORDER BY rowid DESC LIMIT 20')],
                     'operations': [self.operation(row[0]) for row in self.db.execute('SELECT operation_id FROM operations ORDER BY created DESC LIMIT 20')]}

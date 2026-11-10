@@ -74,11 +74,19 @@ class WorkbenchProvider(TerminalEnvironmentProvider):
         settings = settings_for(self.ctx)
         identity = control.request(settings.control_dir, 'open_environment')
         try:
+            capabilities = identity['capabilities']
+            if capabilities.get('session_lifecycle') != 1:
+                raise LinkError(Code.UNSUPPORTED_RUNTIME, 'Worker lacks the required session lifecycle. Update matching plugin, worker and image source.')
+            if (capabilities.get('memory_mb'), capabilities.get('cpus')) != (settings.memory_mb, settings.cpus):
+                raise LinkError(Code.UNSUPPORTED_RUNTIME, 'Worker resources differ from this profile. Match memory_mb/cpus settings and worker launch options.')
             # The backend reads its own inspected image; core's generic image is not its configuration.
             # Refuse an explicitly pinned Docker override rather than imply it changes the local mount.
             if container_config and container_config.get('docker_image_pinned'):
                 if image != identity['image']:
                     raise LinkError(Code.UNSUPPORTED_RUNTIME, 'Pinned image override differs from the accepted worker image.')
+            if container_config and any(container_config.get(name) for name in
+                    ('docker_extra_args', 'docker_volumes', 'docker_mount_cwd_to_workspace', 'docker_forward_env', 'docker_env')):
+                raise LinkError(Code.UNSUPPORTED_RUNTIME, 'Additional Docker mounts, arguments and environment forwarding are unavailable.')
             return WorkbenchEnvironment(settings.control_dir, identity, cwd or '/workspace', timeout)
         except BaseException:
             control.request(settings.control_dir, 'close_environment', environment_id=identity['environment_id'])
@@ -95,13 +103,10 @@ def register(ctx):
         if load_config_readonly().get('terminal', {}).get('backend') != 'workbench_link':
             return None
         args = args or {}
-        command = args.get('command', '')
-        background = (tool_name == 'terminal' and
-            (args.get('background') or (isinstance(command, str) and command.rstrip().endswith('&'))))
-        if tool_name == 'execute_code' or background:
+        if tool_name == 'terminal' and args.get('persist_on_release'):
             return {'action': 'block', 'message':
-                'UNSUPPORTED_RUNTIME: Workbench Link currently supports foreground terminal and native file tools. '
-                'Persistent execute_code kernels and background jobs require lifecycle support that is not implemented. '
+                'UNSUPPORTED_RUNTIME: Workbench jobs belong to the selected environment and stop when it closes. '
+                'persist_on_release is unavailable. '
                 'No operation was dispatched.'}
         return None
     ctx.register_hook('pre_tool_call', guard_lifecycle)

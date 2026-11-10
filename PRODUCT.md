@@ -30,8 +30,8 @@ The hackathon scores usefulness, reliability, polish and creativity; published w
 - Profile-scoped backend selection; separate profile for server-executed automation.
 - No direct credential-store reads, self-updating source or automatic uncertain-command replay.
 
-## Engineering decisions, awaiting implementation evidence
+## Implemented engineering decisions
 
-Linux/Docker first; Python standard library for transport and persistence; a separate broker process; private Unix control socket; worker-initiated authenticated HTTP long polling; HTTPS for any non-loopback connection; full native environment lifecycle testing before release.
+Linux/Docker first; Python standard library for transport and persistence; a separate broker process; private Unix control socket; worker-initiated authenticated HTTP polling; HTTPS for any non-loopback connection; full native environment lifecycle testing before release.
 
-The planning workspace reports Linux/WSL2 and Python 3.14.4; Docker is not on PATH. Docker daemon availability/integration, productive hours and eventual deployment target remain unspecified. The disposable Hermes runtime must use an actually supported interpreter. A macOS, Windows or general WSL/Docker Desktop claim requires its own validation.
+Verified on Linux/WSL Ubuntu-26.04 with Docker 29.1.3, standalone Python 3.11.17 and Hermes's supported Python 3.14.9 runtime. Native persistent kernels/background jobs and durable cleanup are implemented; measured evidence and limits are in docs/RUNTIME_EVIDENCE.md. Physical remote deployment and other operating systems require their own validation.

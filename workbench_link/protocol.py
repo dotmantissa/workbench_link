@@ -126,7 +126,13 @@ def payload_hash(envelope: dict) -> str:
 
 
 def envelope(obj: dict) -> dict:
-    fields(obj, ENVELOPE_FIELDS)
+    fields(obj, ENVELOPE_FIELDS, {'lifecycle', 'terminate_process'})
+    if obj.get('lifecycle', 'operation') not in ('operation', 'session'):
+        bad('Invalid lifecycle scope.')
+    if 'terminate_process' in obj:
+        process_inventory([obj['terminate_process']])
+        if obj.get('lifecycle') != 'session':
+            bad('Process termination requires session ownership.')
     integer(obj["protocol_version"], "protocol_version", VERSION, VERSION)
     for name in ("profile_id", "binding_id", "environment_id", "operation_id",
                  "worker_instance_id", "project_id"):
@@ -151,7 +157,18 @@ def envelope(obj: dict) -> dict:
 
 
 def receipt(obj: dict) -> dict:
-    fields(obj, RECEIPT_FIELDS)
+    fields(obj, RECEIPT_FIELDS, {'termination_scope', 'detached_processes'})
+    scope = obj.get('termination_scope', 'environment')
+    if scope not in ('foreground', 'environment'):
+        bad('Invalid termination scope.')
+    processes = process_inventory(obj.get('detached_processes', []))
+    if scope == 'environment' and processes:
+        bad('Environment termination cannot leave detached processes.')
+    if scope == 'foreground' and (obj['terminal_kind'] != 'completed' or
+                                  obj['termination_method'] != 'natural'):
+        bad('Foreground receipts require natural completion.')
+    if scope == 'foreground' and 'detached_processes' not in obj:
+        bad('Foreground receipts require an explicit process inventory.')
     for name in ("operation_id", "binding_id", "worker_instance_id", "start_grant_id"):
         identifier(obj[name], name)
     for name in ("payload_sha256", "output_sha256"):
@@ -183,3 +200,17 @@ def receipt(obj: dict) -> dict:
     if obj["output_bytes"] == 0 and (obj["last_sequence"] != -1 or obj["output_sha256"] != digest(b"")):
         bad("Invalid empty-output receipt.")
     return obj
+
+
+def process_inventory(value):
+    if type(value) is not list or len(value) > 128:
+        bad('Invalid detached process inventory.')
+    seen = set()
+    for process in value:
+        fields(process, {'pid', 'start_ticks'})
+        integer(process['pid'], 'pid', 2, 2**31 - 1)
+        integer(process['start_ticks'], 'start_ticks', 1)
+        if process['pid'] in seen:
+            bad('Duplicate process identity.')
+        seen.add(process['pid'])
+    return value

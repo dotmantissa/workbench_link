@@ -1,6 +1,8 @@
 # Validation, evidence and release gates
 
-All tests below are planned, not passed. Match tests to behavior and failure consequences; avoid source-shape tests that merely repeat implementation. Do not infer functional success from document lint, source inspection or mocked registration.
+The supported release checks now have measured results in [RUNTIME_EVIDENCE.md](RUNTIME_EVIDENCE.md): 35 unit/socket tests, eleven Docker fault cases, worker smoke, isolated native Hermes routing and fresh standalone wheel installation pass on the final source/image. Clean dedicated-profile directory installation, Plugin Doctor and catalog validation also pass. Full cold-home Hermes dependency setup timed out before plugin enablement; the documented prerequisite is an installed Hermes runtime.
+
+The matrix below defines acceptance scenarios, including future coverage. It is not a claim that every permutation has been exercised. Local trusted-CA/hostname and capacity checks passed; physical WAN/NAT, other operating systems, gateway/delegated workspace isolation, PTY and jobs surviving environment release remain outside version 0.1.0. A live-model agent conversation has not been run. Additional crash-window barriers, adversarial path races, slow-output backpressure and exhaustive disk/SQLite failure permutations remain extended reliability work. Match tests to failure consequences and do not infer functional success from document lint, source inspection or mocked registration.
 
 ## 1. Test topology on the available local machine
 
@@ -94,17 +96,17 @@ Use temporary owner-only directories and no credentials. Property-style generate
 
 ## 6. Verification commands after code exists
 
-The implementation should provide stable named invocations, for example:
+Implemented commands:
 
-```text
-python -m unittest discover -s tests/unit
-python dev/run_integration.py --suite lifecycle
-python dev/run_native.py --hermes-ref v0.23.0 --model-fixture
+```sh
+python -W error::ResourceWarning -m unittest discover -s tests/unit -q
+python tests/integration/worker_smoke.py --image sha256:INSPECTED_IMAGE_ID
+python tests/integration/worker_faults.py --image sha256:INSPECTED_IMAGE_ID
 hermes plugins doctor /absolute/path/to/plugin --ci
 hermes plugins validate /absolute/path/to/plugin --install-deps
 ```
 
-These dev scripts do not exist yet. Final README must contain only implemented commands. Native checks run from the supported disposable Hermes installation and never silently rewrite the user's main HERMES_HOME.
+Run `tests/integration/native_smoke.py --hermes-source dev/hermes --image sha256:INSPECTED_IMAGE_ID` and `tests/integration/install_smoke.py --hermes-source dev/hermes` through the supported disposable Hermes runtime; see [README.md](../README.md) for its environment invocation. These tests use isolated profiles and never rewrite the user's main HERMES_HOME.
 
 ## 7. Evidence record
 

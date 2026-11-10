@@ -58,7 +58,8 @@ class DockerRunner:
         self.reader.start()
         try:
             ready = self.events.get(timeout=5)
-            if ready.get('kind') != 'ready' or ready.get('cwd') != '/workspace':
+            if (ready.get('kind'), ready.get('cwd'), ready.get('protocol_version'), ready.get('session_lifecycle')) != (
+                    'ready', '/workspace', p.VERSION, 1):
                 raise LinkError(Code.UNSUPPORTED_RUNTIME, 'Worker image did not pass runner startup.')
         except (queue.Empty, LinkError):
             self.close()
@@ -169,6 +170,31 @@ class Worker:
         self.last_lease = time.monotonic()
         self.heartbeat_thread = None
 
+    def _report_stopped(self, record):
+        if not record.get('stop_evidence'):
+            return
+        original = WorkerClient(self.client.url.geturl(), self.client.worker_id,
+            record['instance'], self.client.key, local_test=self.client.url.scheme == 'http')
+        original.context = self.client.context
+        original.post('environment_stopped', record['stop_evidence'])
+
+    def _close_runner(self):
+        runner = self.runner
+        if not runner:
+            return True
+        confirmed = runner.close()
+        if confirmed:
+            environment = runner.name.removeprefix('workbench-link-')
+            record = self.store.get('container', environment)
+            record['stop_evidence'] = {'environment_id': environment, 'binding_id': record['binding_id'],
+                'generation': record['generation'], 'termination_confirmed': True,
+                'termination_method': 'container_stop'}
+            with self.store.transaction():
+                self.store.put('container', environment, record)
+            self.runner = None
+            self._report_stopped(record)
+        return confirmed
+
     def _cleanup_previous(self):
         # Inventory exactly our previously recorded container names, never unrelated containers.
         for record in self.store.all('container'):
@@ -177,13 +203,23 @@ class Worker:
                 '{{index .Config.Labels "workbench-link.instance"}} {{index .Config.Labels "workbench-link.owner"}}', name],
                 capture_output=True, timeout=3, check=False)
             if inspected.returncode:
-                continue
-            if inspected.stdout.decode().strip() != f"{record['instance']} {os.getuid()}":
-                raise LinkError(Code.BINDING_STALE, 'Recorded container ownership is ambiguous; refusing automatic cleanup.')
-            stopped = subprocess.run([self.docker, 'stop', '--time', '2', name], capture_output=True, timeout=5, check=False)
-            if stopped.returncode:
-                raise LinkError(Code.OUTCOME_UNKNOWN, 'A previous worker container could not be stopped.')
-            subprocess.run([self.docker, 'rm', name], capture_output=True, timeout=3, check=False)
+                if inspected.stderr.decode().strip() != f'Error: No such object: {name}':
+                    raise LinkError(Code.OUTCOME_UNKNOWN, 'Cannot inspect a recorded container; refusing new work.')
+            else:
+                if inspected.stdout.decode().strip() != f"{record['instance']} {os.getuid()}":
+                    raise LinkError(Code.BINDING_STALE, 'Recorded container ownership is ambiguous; refusing automatic cleanup.')
+                subprocess.run([self.docker, 'stop', '--time', '2', name], capture_output=True, timeout=5, check=False)
+                confirmed = subprocess.run([self.docker, 'inspect', '--format', '{{.State.Running}}', name],
+                    capture_output=True, timeout=3, check=False)
+                if confirmed.returncode or confirmed.stdout.strip() != b'false':
+                    raise LinkError(Code.OUTCOME_UNKNOWN, 'A previous worker container could not be confirmed stopped.')
+                subprocess.run([self.docker, 'rm', name], capture_output=True, timeout=3, check=False)
+            if 'binding_id' in record:
+                record['stop_evidence'] = {'environment_id': name.removeprefix('workbench-link-'),
+                    'binding_id': record['binding_id'], 'generation': record['generation'],
+                    'termination_confirmed': True, 'termination_method': 'container_stop'}
+                with self.store.transaction():
+                    self.store.put('container', name.removeprefix('workbench-link-'), record)
         for record in self.store.all('operation'):
             if record['state'] not in ('TERMINAL', 'ACKNOWLEDGED', 'NOT_STARTED'):
                 with self.store.transaction():
@@ -200,7 +236,8 @@ class Worker:
                 self.last_lease = time.monotonic()
                 runner = self.runner
                 if runner:
-                    runner.send({'action': 'cancel' if response['cancel_requested'] else 'renew'})
+                    closing = runner.name.removeprefix('workbench-link-') in response.get('close_environments', [])
+                    runner.send({'action': 'cancel' if response['cancel_requested'] or closing else 'renew'})
             except (LinkError, OSError):
                 if time.monotonic() - self.last_lease >= 15:
                     if self.runner:
@@ -236,11 +273,12 @@ class Worker:
         with self.store.transaction():
             self.store.put('operation', operation_id, record)
         if not self.runner or self.runner.name != 'workbench-link-' + envelope['environment_id']:
-            if self.runner and not self.runner.close():
+            if self.runner and not self._close_runner():
                 raise LinkError(Code.OUTCOME_UNKNOWN, 'Old environment could not be stopped.')
             name = 'workbench-link-' + envelope['environment_id']
             with self.store.transaction():
-                self.store.put('container', envelope['environment_id'], {'name': name, 'instance': self.instance})
+                self.store.put('container', envelope['environment_id'], {'name': name, 'instance': self.instance,
+                    'binding_id': envelope['binding_id'], 'generation': envelope['generation']})
             self.runner = DockerRunner(self.docker, self.image, self.project, self.instance,
                 envelope['binding_id'], envelope['environment_id'], memory_mb=self.memory_mb, cpus=self.cpus)
         self.active_operation = operation_id
@@ -280,9 +318,12 @@ class Worker:
                     record.update(state='TERMINAL', receipt=p.receipt(event['receipt']))
                     with self.store.transaction():
                         self.store.put('operation', operation_id, record)
+                        container = self.store.get('container', envelope['environment_id'])
+                        container['inventory'] = event['receipt'].get('detached_processes', [])
+                        self.store.put('container', envelope['environment_id'], container)
                     self._post_outputs_receipt(record)
                     if event['receipt']['terminal_kind'] == 'cancelled':
-                        self.runner.close(); self.runner = None
+                        self._close_runner()
                     return
                 else:
                     raise LinkError(Code.OUTCOME_UNKNOWN, 'Runner stopped without a verified receipt.', operation_id)
@@ -292,7 +333,7 @@ class Worker:
                 with self.store.transaction():
                     self.store.put('operation', operation_id, record)
             if self.runner:
-                self.runner.close(); self.runner = None
+                self._close_runner()
             raise
         finally:
             self.active_operation = None
@@ -303,9 +344,12 @@ class Worker:
         for record in self.store.all('operation'):
             if record['state'] == 'TERMINAL':
                 self._post_outputs_receipt(record)
+        for record in self.store.all('container'):
+            self._report_stopped(record)
         self.client.post('hello', {'protocol_version': 1, 'project_id': self.project_id,
             'alias': self.alias, 'image': self.image, 'capabilities': {
-                'bash': True, 'python': True, 'ripgrep': True, 'memory_mb': self.memory_mb, 'cpus': self.cpus}})
+                'bash': True, 'python': True, 'ripgrep': True, 'memory_mb': self.memory_mb,
+                'cpus': self.cpus, 'session_lifecycle': 1}})
         print(json.dumps({'worker_id': self.client.worker_id, 'instance_id': self.instance,
                           'project_id': self.project_id, 'image': self.image,
                           'selected_mount': str(self.project) + ' → /workspace (writable)'}), flush=True)
@@ -318,6 +362,9 @@ class Worker:
                         self._post_outputs_receipt(record)
                 response = self.client.post('poll', {})
                 self.binding = response.get('binding')
+                if self.runner and self.runner.name.removeprefix('workbench-link-') in response.get('close_environments', []):
+                    if not self._close_runner():
+                        raise LinkError(Code.OUTCOME_UNKNOWN, 'Environment stop could not be confirmed.')
                 if response.get('envelope'):
                     self.execute(response['envelope'])
                 else:
@@ -332,7 +379,11 @@ class Worker:
         if self.heartbeat_thread:
             self.heartbeat_thread.join(4)
         if self.runner:
-            self.runner.close()
+            try:
+                self._close_runner()
+            except LinkError:
+                # Durable stop evidence is resent on the next startup.
+                pass
         os.close(self.lock_fd)
         self.store.close()
 

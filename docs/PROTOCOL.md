@@ -1,202 +1,99 @@
 # Protocol and durable state contract
 
-Normative for the initial implementation. `MUST` denotes a release requirement. Version the wire protocol independently from plugin, Hermes and ledger versions. No network transport is implemented yet.
+The implemented wire protocol is version 1 with explicit optional session extensions. Ledger schema is version 2. Plugin/Hermes versions are independent. Both services share [protocol.py](../workbench_link/protocol.py); unsupported fields and mismatched required behavior fail closed.
 
-## 1. Identifiers and encoding
+## Encoding and identities
 
-- `protocol_version`: integer `1`; exact match required initially.
-- `profile_id`: random UUID created once in profile-scoped broker state.
-- `worker_id`: operator-selected stable slug, 1–64 ASCII letters/digits/underscore/hyphen.
-- `worker_instance_id`: new UUID each worker process start.
-- `project_id`: random UUID for an explicitly registered local project; display alias is not identity.
-- `binding_id`: broker UUID, immutable association of profile, worker instance, project and generation.
-- `generation`: durable positive integer, incremented only for an explicitly accepted replacement binding.
-- `environment_id`: opaque UUID, allocated per native environment lifetime.
-- `operation_id`: UUID created before first dispatch and reused for delivery/recovery of that operation.
-- `request_nonce`: fresh 128-bit-or-larger random value for every HTTP attempt, including retries.
+Canonical UTF-8 JSON uses sorted keys, compact separators, no duplicate keys or nonfinite numbers. Integers reject booleans. UUIDs are canonical lowercase strings; worker/project aliases are bounded ASCII slugs. Base64 is canonical and checked before allocation. Limits: 256 KiB script, 4 MiB stdin, 64 KiB output chunk, 16 MiB operation output, 6 MiB wire/control frame and 600 seconds per runner operation.
 
-Encode JSON as UTF-8, sorted keys, compact separators, no NaN/Infinity and no duplicate object keys. Validate exact field types; booleans are not accepted as integers. UUIDs are canonical lowercase hyphenated strings. Protocol metadata strings contain no newlines/NUL; shell text is a separately bounded field and may contain newlines. Additive optional fields may be ignored only when explicitly specified; required behavior changes need a new protocol version.
+The immutable envelope requires:
 
-`payload_sha256` is the digest of canonical immutable execution payload: binding, generation, environment, operation, script, login flag, stdin bytes and timeout. IDs are never constructed from shell text. Reuse of an operation ID with another digest fails with `PAYLOAD_CONFLICT` and fences the binding.
-
-## 2. Execution envelope
-
-```json
-{
-  "protocol_version": 1,
-  "profile_id": "11111111-1111-4111-8111-111111111111",
-  "binding_id": "22222222-2222-4222-8222-222222222222",
-  "generation": 1,
-  "environment_id": "33333333-3333-4333-8333-333333333333",
-  "operation_id": "44444444-4444-4444-8444-444444444444",
-  "worker_id": "local-dev",
-  "worker_instance_id": "55555555-5555-4555-8555-555555555555",
-  "project_id": "66666666-6666-4666-8666-666666666666",
-  "script": "cd /workspace && python -m unittest",
-  "login": false,
-  "stdin_b64": "",
-  "timeout_seconds": 120,
-  "payload_sha256": "<computed 64-character lowercase hex digest>"
-}
+```text
+protocol_version, profile_id, binding_id, generation, environment_id,
+operation_id, worker_id, worker_instance_id, project_id,
+script, login, stdin_b64, timeout_seconds, payload_sha256
 ```
 
-Example IDs/digest placeholders are explanatory and must not appear as fixed runtime values. `script` is the native BaseEnvironment-wrapped command, not a second shell template invented by the broker. The worker never inserts the script into host shell strings. Worker runner uses bash argv with the script as one argument, or a private source file in container scratch where length demands it. User stdin is transmitted exactly once to bash, through a channel separate from runner control.
+`payload_sha256` hashes canonical JSON of every envelope field except the digest itself. Retries retain all IDs, payload and hash. Reusing an operation ID with a different payload fences the original binding. Normal scripts are native BaseEnvironment-wrapped commands, stored in private container scratch and executed through fixed Bash argv. Runner control and command stdin are separate pipes. Neither broker nor worker executes user shell on the host.
 
-Transport is not a new command authorization layer. The adapter submits only the command already routed by Hermes. Management endpoints cannot ask the native environment to execute shell on behalf of an unauthenticated HTTP caller.
+Optional `lifecycle` is `operation` (default) or `session`. Operation mode requires all command descendants stopped before completion. The native adapter uses session mode: detached processes belong to the environment and may outlive a foreground call.
 
-## 3. Worker HTTP API
+Optional `terminate_process: {pid, start_ticks}` is session-only. The pinned native scalar kill and kernel teardown forms map to this identity-checked container tree-control operation. The original script remains part of the durable audit hash; runner control terminates the recorded process tree rather than killing only its shell wrapper or a recycled PID. TERM targets the parent first; KILL includes its private launch group to catch children spawned during grace. Other native commands use the normal shell path.
 
-API base `/v1/worker`. Each endpoint requires request authentication. No admin endpoint is mounted on this listener.
+## Worker API and authentication
 
-| Method/path | Input | Output and invariant |
-|---|---|---|
-| `POST /hello` | identity, protocol, project ID/alias, image/runtime capabilities | readiness or explicit binding conflict; never chooses worker paths |
-| `POST /heartbeat` | instance, binding/generation, active operation ID | lease deadline and pending cancel/close flags |
-| `POST /poll` | instance/binding, max wait ≤2 seconds | zero/one envelope; redispatch preserves operation ID/hash |
-| `POST /accept` | operation ID/hash and durable worker acceptance | one idempotent start grant if binding is active and uncancelled |
-| `POST /running` | grant ID, operation and runner identity | acknowledgement; missing ack never causes a second spawn |
-| `POST /output` | operation, sequence, offset, bytes and chunk digest | durable contiguous acknowledgement |
-| `POST /result` | terminal receipt, output digest/count, runner termination facts | idempotent receipt acknowledgement |
-| `POST /recover` | bounded list of unresolved operation IDs and local receipts | missing receipt requests/canonical states; no new command execution |
+Only POST under `/v1/worker/` is accepted:
 
-The worker must persist acceptance before `/accept`. Broker commits `START_GRANTED` and a unique `start_grant_id` before returning permission to launch. A repeated `/accept` returns the same grant if valid, or refusal; it cannot allocate a second operation. Grant identity includes generation/instance and has a bounded launch window. Expired grants are never silently replaced after launch intent exists.
+| Endpoint | Effect |
+|---|---|
+| `hello` | Immutable instance/project/image/capability registration |
+| `heartbeat` | Binding/generation/active operation renewal, cancel and close requests |
+| `poll` | Zero/one queued envelope plus matching binding and close requests |
+| `accept` | Durable idempotent start grant, with a five-second launch window |
+| `running` | Launch report for the original grant |
+| `output` | Contiguous chunk commit and acknowledgement |
+| `result` | Verified immutable terminal receipt acknowledgement |
+| `recover` | At most 32 historical operation states; no execution |
+| `environment_stopped` | Historical instance/generation container-stop evidence |
 
-On a lost grant response, the worker repeats `/accept` for the same ID/hash using a new request nonce. Once it records `LAUNCHING`, a process restart must reconcile and must not automatically spawn again. This is a two-stage dedup protocol, not exactly-once execution.
+The worker persists ACCEPTED, GRANTED and LAUNCHING before launch. Anything already LAUNCHING/RUNNING/UNKNOWN is never automatically spawned again. Terminal output/receipts are uploaded with the historical instance identity before new registration on restart. A lost receipt acknowledgement retries the same receipt, not the command.
 
-Use JSON error envelope `{ "ok": false, "code": "...", "message": "...", "operation_id": null }`. HTTP 400: malformed; 401: failed signature; 409: stale/conflict/fence; 413: limits; 429: capacity; 503: storage/runtime unavailable. Worker retries safe transport requests with backoff; terminal conflicts do not produce an infinite reconnect loop.
-
-Redirects are never followed. Connection, body-read and request deadlines are bounded separately. Do not retain a worker request thread waiting for a native operation to complete.
-
-## 4. Request authentication
-
-Header fields: `X-WBL-Version`, `X-WBL-Worker`, `X-WBL-Instance`, `X-WBL-Time`, `X-WBL-Nonce`, `X-WBL-Body-SHA256`, `X-WBL-Signature`. These metadata fields have strict length/character constraints and are omitted from logs.
-
-Canonical signing input is newline-separated, in this exact order:
+HMAC-SHA256 signs this ASCII string, with newlines and no trailing newline:
 
 ```text
 WBL1
-HTTP_METHOD_IN_UPPERCASE
-EXACT_API_PATH_WITHOUT_QUERY
-UNIX_TIMESTAMP_SECONDS
-REQUEST_NONCE
+POST
+EXACT_PATH
+UNIX_TIMESTAMP
+NONCE
 WORKER_ID
 WORKER_INSTANCE_UUID
-LOWERCASE_SHA256_OF_RAW_BODY
+SHA256_OF_RAW_BODY
 ```
 
-No trailing newline. The signature is lowercase hex HMAC-SHA256 with the decoded 32-byte-or-larger worker key. Reject path/query normalization differences rather than guessing the caller's intention. Decode one canonical key format during setup, e.g. hex; do not accept ambiguous formats at runtime.
+Headers: `X-WBL-Version`, `X-WBL-Worker`, `X-WBL-Instance`, `X-WBL-Time`, `X-WBL-Nonce`, `X-WBL-Body-SHA256`, `X-WBL-Signature`. Keys are deliberately supplied canonical lowercase hex encoding 32–128 bytes. Validate configured worker, exact path, ±30-second clock tolerance, body digest and constant-time signature before consuming the nonce. Nonces persist for 120 seconds with a 4096-entry cap. Retries use fresh nonces.
 
-Verify bounded body digest, configured worker ID/key, protocol, ±30-second timestamp tolerance, then signature with constant-time comparison. Atomically insert a nonce into a ledger table unique on credential generation/worker/nonce before handling the endpoint. Nonces persist for 120 seconds; reject replay even when it repeats an idempotent result upload. Legitimate retries use a fresh nonce and the same operation identity.
+HTTP 400 reports malformed/oversized requests, 401 authentication failure, 409 conflicts/fences, 429 capacity, and 503 storage unavailability. Redirects and chunked requests are refused. Request handlers, body reads and responses are bounded. TLS handshakes run in bounded handlers rather than blocking the accept loop. Non-loopback transport requires verified HTTPS; plain HTTP requires explicit loopback local-test mode. HMAC is peer authentication, not command approval; Hermes's normal policy still applies.
 
-Bound nonce storage and rate-limit failed requests by peer/worker without logging keys. Clock mismatch produces an actionable sync-clock error and no execution. Worker leases use local monotonic clocks, not client timestamps.
+## Private control
 
-TLS authenticates the server and protects confidentiality. HMAC does not replace HTTPS. Key rotation is a manual quiescent restart: refuse active work, replace the Hermes-owned key and explicitly provide it to the worker. Old requests and grants cease to be accepted. Do not persist the raw key in either ledger.
+Profile-owned 0700 directory, 0600 Unix socket and Linux peer-UID checks. Frames use a four-byte unsigned network-order length then canonical JSON, with a three-second deadline. No TCP admin fallback exists.
 
-## 5. Private host control API
+Actions: `status`, `bind`, `open_environment`, `submit`, `operation_status`, `read_output`, `cancel`, `close_environment`, `recover`, `stop`, `resolve_unknown`, `reset`. Worker HTTP cannot perform these operator actions. The same-user host/operator is trusted; model project commands have no broker socket mount.
 
-Unix socket under an owner-only profile-scoped directory; socket mode 0600. Use Linux peer-UID verification. Resolve a too-long Unix path through an explicitly configured owner-only shorter directory, not a public `/tmp` socket. No fallback TCP admin listener.
+## Operations and receipts
 
-Framing: 4-byte unsigned network-order body length followed by bounded canonical JSON. Authenticate by peer owner. One request per connection initially; fixed response framing. Validate size before allocation and use monotonic read/write deadlines. Control operations:
+Broker states are QUEUED → START_GRANTED → RUNNING → COMPLETED/CANCELLED, with NOT_STARTED permitted before a grant. Missing launch/termination proof produces UNKNOWN. A matching late receipt can resolve UNKNOWN to a known terminal state without replay, while its fence remains. Human reconciliation records RESOLVED_UNKNOWN with no success exit code. Worker states are ACCEPTED → GRANTED → LAUNCHING → RUNNING → TERMINAL → ACKNOWLEDGED.
 
-`status`, `bind`, `submit`, `operation_status`, `read_output`, `cancel`, `close_environment`, `reconcile_receipts`, `resolve_unknown`, `shutdown`.
+Chunks have sequence starting at zero, contiguous byte offset, canonical base64 and SHA-256. Exact duplicates acknowledge; conflicts fence. Spools publish by fsync/atomic rename before database references. A receipt requires all chunks and a verified final digest/count. Range reads verify selected chunks; final receipt verification covers all bytes. Missing spools never trigger command replay.
 
-`resolve_unknown` and `shutdown` are operator-management requests, never worker HTTP actions or model tools. `submit` is an adapter request with immutable binding IDs; it cannot alter worker registration. Durable journal transitions do not depend on the client keeping its IPC connection open.
-
-## 6. Host state machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> QUEUED
-    QUEUED --> ACCEPTED: worker durable acceptance
-    ACCEPTED --> START_GRANTED: broker permission committed
-    START_GRANTED --> RUNNING: worker launch report
-    RUNNING --> COMPLETED: verified terminal receipt
-    START_GRANTED --> COMPLETED: fast exit receipt
-    QUEUED --> NOT_STARTED: cancelled before any grant
-    ACCEPTED --> NOT_STARTED: grant atomically refused
-    START_GRANTED --> UNKNOWN: launch/result cannot be proved
-    RUNNING --> UNKNOWN: connection or process evidence lost
-    START_GRANTED --> CANCELLED: confirmed no live runner
-    RUNNING --> CANCELLED: confirmed termination
-    UNKNOWN --> COMPLETED: recovered immutable receipt
-    UNKNOWN --> CANCELLED: recovered termination receipt
-    UNKNOWN --> RESOLVED_UNKNOWN: explicit operator reconciliation
-```
-
-The diagram abbreviates startup transport delivery: an envelope may be sent multiple times before ACCEPTED, but never with a new ID. `cancel_requested` is orthogonal and can be set in any nonterminal state. Fence the generation whenever a start-granted/running operation loses proof, termination is pending, output integrity fails without bounded termination, or a conflicting payload is observed.
-
-`NOT_STARTED` is allowed only with durable evidence that no valid start grant was issued, or an explicit worker receipt proving launch was never attempted and that the grant is revoked. Lack of a response is not that evidence. Normal command failure (e.g. test exit 1) is `COMPLETED`, with that exact exit code.
-
-`RESOLVED_UNKNOWN` retains the original unknown history and operator note. It has no success exit code. Clearing its fence authorizes future distinct operations, not replay of the old one.
-
-## 7. Worker state machine and launch crash windows
-
-Worker ledger: `ACCEPTED → GRANTED → LAUNCHING → RUNNING → TERMINAL`; `UNKNOWN` may replace any state after GRANTED when process evidence is lost. Acceptance, grant and launch intent are separately committed.
-
-| Crash window | Recovery behavior |
-|---|---|
-| Before acceptance commit | envelope may be accepted later using same operation ID |
-| After acceptance, before start grant | repeat acceptance; no spawn without valid grant |
-| Grant received, before launch intent | verify grant validity and broker state; revoke safely if expired |
-| Launch intent committed, before PID/runner recorded | assume uncertain; do not spawn again |
-| After spawn, before running report | reconcile local runner/container evidence; no second spawn |
-| After filesystem effects, before receipt commit | uncertain effects; stop runner/container and fence |
-| After terminal receipt commit, before upload | resend stored receipt/output; never rerun |
-| Host receipt committed, before HTTP acknowledgement | duplicate matching receipt succeeds idempotently |
-
-On startup the worker inventories only its own labeled containers/runner state. It does not scan unrelated files or stop another user's container. Labels include worker instance, binding and environment IDs; reject ambiguous/mismatched container ownership. After a restart, old-instance environments are stopped or explicitly reconciled before a new instance is accepted.
-
-## 8. Output and terminal receipts
-
-Chunk fields: operation ID, sequence starting at 0, byte offset starting at 0, base64 bytes and SHA-256 chunk digest. Maximum raw chunk 64 KiB. Broker commits a chunk before acknowledging; retries of the same sequence/hash/offset are idempotent. Different bytes at an existing sequence cause `OUTPUT_CONFLICT`. Missing/reordered chunks are refused with the expected offset; worker retransmits from its durable spool.
-
-The worker concurrently drains output, uploads chunks and renews the lease. Bound spool storage so a stalled network cannot fill disk. A full spool cancels the process, marks limit failure/uncertainty and fences if termination remains unknown. Control/heartbeat capacity is reserved.
-
-Terminal receipt fields:
+Required receipt fields:
 
 ```text
-operation_id, payload_sha256, binding_id, generation,
-worker_instance_id, start_grant_id,
-terminal_kind = completed | cancelled | not_started,
-exit_code = integer | null,
-output_bytes, output_sha256, last_sequence,
-termination_confirmed = boolean,
-termination_method = natural | group_term | group_kill | container_stop | never_started,
-output_complete = boolean,
-error_code = string | null,
-worker_elapsed_ms = nonnegative integer
+operation_id, payload_sha256, binding_id, generation, worker_instance_id,
+start_grant_id, terminal_kind, exit_code, output_bytes, output_sha256,
+last_sequence, termination_confirmed, termination_method,
+output_complete, error_code, worker_elapsed_ms
 ```
 
-A completed receipt requires an actual process exit code, verified final output count/digest, and no unresolved child/runner lifecycle. A shell exits with a partial-output limit failure only as an explicitly unusable result; it cannot be passed to a native file parser as successful data. Zero-byte output has SHA-256 of empty bytes and no chunks. No wall-clock timestamp proves ordering; state/sequence transactions do.
+`terminal_kind` is completed/cancelled/not_started. Completed includes the actual foreground exit code, including shell failures. Other kinds have a null exit code. Zero output requires SHA-256 of empty bytes and sequence -1. Incomplete output requires an error and is never successful file data.
 
-Broker accepts duplicate identical terminal receipts; contradictory receipts fence rather than choose the more convenient answer. Audit records preserve both the conflict and original receipt hash. The adapter verifies the broker's stored receipt before exposing success.
+Optional `termination_scope` defaults to environment. Session receipts must declare it explicitly. A completed foreground receipt uses `foreground` plus mandatory `detached_processes: [{pid, start_ticks}, …]`. It proves foreground capture/termination only. Background output lives in native job logs and is retrieved by subsequent operations. Cancellation uses environment scope with no surviving processes. Scope cannot be weakened for an operation-mode envelope.
 
-## 9. Cancellation, disconnect and leases
+The broker records potential session ownership at grant time, before launch. Therefore a lost receipt cannot hide detached work. Process inventory snapshots and worker container inventory are durable. The container remains the final ownership/cleanup boundary, including processes created after a snapshot.
 
-User/core timeout or stop sets cancel_requested durably. Heartbeat/poll responses carry this flag. Worker asks runner to TERM the identified group, waits ≤2 seconds, then KILLs. If descendants cannot be ruled out, stop the whole binding container. Receipt says which action actually confirmed termination. A cancel request racing a natural exit may result in a completed receipt; do not relabel a real exit as cancellation.
+## Environment lifecycle and fences
 
-Worker daemon monitors the time since its last successful lease renewal using a monotonic clock. At fifteen seconds it terminates/stops the environment and records the result locally. The broker independently marks a missing worker unavailable and fences start-granted/running work. A container-local watchdog must also stop active runner processes if the worker daemon dies while the broker lease can no longer be renewed. Do not depend exclusively on an in-memory worker thread surviving SIGKILL.
+One OPEN/CLOSING environment is admitted per profile. Session close enters CLOSING until `environment_stopped` matches the exact environment/binding/generation/worker instance and confirms `container_stop`. Only then is the environment CLOSED with empty live inventory. Stopped evidence does not undo project effects or invent an operation receipt.
 
-Watchdog renewal uses a runner control path unavailable to the model bash child as a credentialed broker operation. The watchdog is a fail-stop mechanism, not an adversarial sandbox boundary against malicious code in the same container. The worker also reconciles/stops surviving labeled containers on restart. If the watchdog cannot be proved for daemon death, detached process claims cannot ship.
+Broker restart and lease loss fence every potentially live session environment even if its foreground launch is COMPLETED. Unknown operation history remains. Late receipts/stopped evidence cannot reopen the environment or clear the fence. Stop fences execution; reset requires no unresolved operations and no live/pending session environments, retains the closed-generation tombstone and creates a new generation. Replayed old generations cannot execute.
 
-A reconnect uploads stored receipts first. It does not unlock a generation, change project binding, restart lost commands or create a fresh operation for an old request. Lease expiry stops execution; it does not roll back filesystem effects.
+Worker/container lease is fifteen seconds. The PID-1 runner stops children on renewal loss/control EOF; worker restart checks only recorded container names and ownership, then confirms stopped state. Cancellation escalates TERM/KILL and container-stop fallback. This watchdog is failure control for trusted code, not an adversarial boundary against same-user container code.
 
-## 10. Ledger schema, storage and retention
+Human resolution requires UNKNOWN, confirmed stopped environment, a nonsecret note and exact operation confirmation. The CLI refuses noninteractive resolution. History remains unknown; reset authorizes future distinct commands, never replay.
 
-Broker tables:
+## Storage
 
-- `meta(schema_version, profile_id, credential_generation, created_at)`
-- `worker_registration(worker_id, instance_id, project_id, alias, capability_json, state)`
-- `bindings(binding_id, generation, environment_id, state, fence_reason, last_lease)`
-- `operations(operation_id, binding_id, payload_sha256, payload_ref, state, grant_id, cancel_requested, receipt_json, receipt_sha256, created_at, updated_at)`
-- `output_chunks(operation_id, sequence, offset, byte_count, digest, spool_ref)`
-- `events(event_id, operation_id, event_kind, old_state, new_state, safe_metadata_json)`
-- `request_nonces(credential_generation, worker_id, nonce, expires_at)`
+SQLite uses WAL, FULL synchronization, foreign keys and serialized writer transactions. Broker tables: meta, registrations, bindings, environments, operations, output_chunks, nonces, records and events. Environment schema 2 adds session_owned, inventory_json and stop_json. Schema 1 reopens additively; unknown schemas refuse startup.
 
-Worker has analogous operations/chunks/events plus project registrations and container/runner identity. Add unique keys and foreign keys for every relationship. Store payloads/spools as private files with atomic write/rename, then publish a database reference; startup removes unreachable orphan spools only within its own directory. A missing referenced spool is an integrity failure, never regenerated by rerunning a command.
-
-One database writer per service, transactional compare-and-swap state transitions and `synchronous=FULL`. WAL use and filesystem support are checked. Unknown schemas and failed migrations refuse startup. Do not use a second connection's unlocked updates for binding fences.
-
-Default retention: unresolved operations/receipts retained until explicit resolution; complete payload/stdin spools removed after terminal acknowledgement, keeping hashes/receipts; output retained up to 24 hours subject to quota; compact nonsecret receipts/events seven days. Never delete dedup tombstones for an active generation. After a generation closes and expires, retain a closed-generation tombstone so delayed requests are refused. Purge obeys fences and quota; it does not erase the only evidence of uncertain work.
-
-Raw payload/stdin/output can contain project secrets. File permissions and retention limit exposure; no encryption-at-rest claim is made. Neither ledger contains the transport key or Hermes/vendor credentials.
+Each service uses private local filesystem state and a 512 MiB spool quota. Referenced data cannot be regenerated. Payloads/stdin/output remain retained until deliberate quiescent operator maintenance; timed deletion/purge is outside version 0.1.0. Neither ledger stores the transport key. No encryption-at-rest or exactly-once effect guarantee is claimed.

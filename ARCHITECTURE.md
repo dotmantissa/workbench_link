@@ -1,6 +1,6 @@
 # Workbench Link architecture
 
-This is the authoritative build plan. The protocol, operations and validation documents expand its contracts; they must be updated together when a decision changes. Proposed module names and commands below are implementation specifications, not existing code.
+This document preserves the design rationale and extended build targets. The implemented source, README, protocol, operations and runtime evidence define version 0.1.0 behavior. Some proposed module names and extended interfaces below remain design targets. Session-scoped foreground receipts, detached process identity and confirmed environment-stop evidence supersede the initial foreground-only lifecycle assumptions.
 
 ## 1. Outcome and engineering bar
 

@@ -70,10 +70,11 @@ class PrivateHandler(socketserver.BaseRequestHandler):
 
 
 class WorkerServer(BoundedThreads, http.server.HTTPServer):
-    def __init__(self, address, broker):
+    def __init__(self, address, broker, tls_context=None):
         self.capacity = threading.BoundedSemaphore(32)
         self.work_capacity = threading.BoundedSemaphore(12)
         self.broker = broker
+        self.tls_context = tls_context
         super().__init__(address, WorkerHandler)
 
 
@@ -81,8 +82,30 @@ class WorkerHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.0'
 
     def setup(self):
+        self.request.settimeout(2)
+        context = self.server.tls_context
+        if context:
+            # TLS handshakes belong to a bounded handler, never the accept loop.
+            self.request = context.wrap_socket(self.request, server_side=True, do_handshake_on_connect=False)
+            timer = threading.Timer(3, self.request.close)
+            timer.daemon = True
+            timer.start()
+            try:
+                self.request.do_handshake()
+            except BaseException:
+                self.request.close()
+                raise
+            finally:
+                timer.cancel()
         super().setup()
         self.connection.settimeout(2)
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            if self.server.tls_context:
+                self.request.close()
 
     def log_message(self, *args):
         pass
@@ -175,6 +198,7 @@ class Broker:
         self.store = Store(settings.control_dir)
         self.ledger = Ledger(self.store)
         self.stop_event = threading.Event()
+        self.accepting = True
         self.heartbeat_lock = threading.Lock()
         self.heartbeats = {}
         self.threads = []
@@ -205,9 +229,7 @@ class Broker:
             self.ledger.recover_startup()
             self.private = PrivateServer(socket_path, self)
             os.chmod(socket_path, 0o600)
-            self.http = WorkerServer(address, self)
-            if tls_context:
-                self.http.socket = tls_context.wrap_socket(self.http.socket, server_side=True)
+            self.http = WorkerServer(address, self, tls_context)
         except BaseException:
             self.close()
             raise
@@ -234,6 +256,8 @@ class Broker:
 
     def dispatch_control(self, args):
         action = args.get('action')
+        if not self.accepting and action in ('submit', 'open_environment', 'bind', 'reset'):
+            raise LinkError(Code.WORKER_UNAVAILABLE, 'Broker is shutting down; execution refused.')
         if action == 'status':
             p.fields(args, {'action'})
             status = self.ledger.status()
@@ -269,6 +293,16 @@ class Broker:
         if action == 'close_environment':
             p.fields(args, {'action', 'environment_id'})
             return self.ledger.close_environment(args['environment_id'])
+        if action in ('recover', 'stop', 'reset'):
+            p.fields(args, {'action'})
+            if action == 'reset':
+                self.ledger.reset()
+            elif action == 'stop':
+                self.ledger.stop()
+            return self.dispatch_control({'action': 'status'})
+        if action == 'resolve_unknown':
+            p.fields(args, {'action', 'operation_id', 'note', 'confirmation'})
+            return self.ledger.resolve_unknown(args['operation_id'], args['note'], args['confirmation'])
         p.bad('Unsupported private control action.')
 
     def dispatch_worker(self, action, instance, args):
@@ -282,7 +316,8 @@ class Broker:
         if action == 'heartbeat':
             p.fields(args, {'binding_id', 'generation', 'active_operation_id'})
             binding = self.ledger.status()['binding']
-            if binding and (binding['instance_id'], binding['binding_id'], binding['generation']) != (instance, args['binding_id'], args['generation']):
+            unbound = args['binding_id'] is None and args['generation'] is None and args['active_operation_id'] is None
+            if binding and not unbound and (binding['instance_id'], binding['binding_id'], binding['generation']) != (instance, args['binding_id'], args['generation']):
                 raise LinkError(Code.BINDING_STALE, 'Heartbeat cannot renew another binding generation.')
             if not binding and (args['binding_id'] is not None or args['generation'] is not None):
                 p.bad('Unbound heartbeat identity must be null.')
@@ -292,10 +327,15 @@ class Broker:
             if args['active_operation_id'] is not None:
                 op = self.ledger.operation(args['active_operation_id'])
                 cancel = cancel or op['cancel_requested']
-            return {'ok': True, 'lease_seconds': LEASE_SECONDS, 'cancel_requested': cancel}
+            return {'ok': True, 'lease_seconds': LEASE_SECONDS, 'cancel_requested': cancel,
+                    'close_environments': self.ledger.closing_environments(instance)}
         if action == 'poll':
             p.fields(args, set())
-            return self.ledger.poll(instance)
+            result = self.ledger.poll(instance)
+            result['close_environments'] = self.ledger.closing_environments(instance)
+            return result
+        if action == 'environment_stopped':
+            return self.ledger.environment_stopped(instance, args)
         if action in ('accept', 'running'):
             required = {'operation_id', 'payload_sha256'} | ({'start_grant_id'} if action == 'running' else set())
             p.fields(args, required)
@@ -326,6 +366,15 @@ class Broker:
         p.bad('Unsupported worker action.')
 
     def close(self):
+        self.accepting = False
+        if self.threads:
+            self.ledger.stop()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                status = self.ledger.status()
+                if not any(env['state'] == 'CLOSING' for env in status['environments']):
+                    break
+                time.sleep(.05)
         self.stop_event.set()
         if self.threads:
             for server in (self.http, self.private):

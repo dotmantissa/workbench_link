@@ -36,6 +36,84 @@ class Runner:
         return [int(path.name) for path in Path('/proc').iterdir()
                 if path.name.isdecimal() and int(path.name) not in (1, os.getpid())]
 
+    def inventory(self):
+        processes = []
+        for pid in self.children():
+            try:
+                raw = Path(f'/proc/{pid}/stat').read_text()
+                fields = raw[raw.rindex(')') + 2:].split()
+                if fields[0] != 'Z':
+                    processes.append({'pid': pid, 'start_ticks': int(fields[19])})
+            except FileNotFoundError:
+                continue
+        return p.process_inventory(processes)
+
+    def reap(self):
+        try:
+            while os.waitpid(-1, os.WNOHANG)[0]:
+                pass
+        except ChildProcessError:
+            pass
+
+    def terminate_tree(self, target):
+        inventory = self.inventory()
+        if target not in inventory:
+            return 1
+        group = os.getpgid(target['pid'])
+        if group <= 1:
+            raise RuntimeError('Refusing runner process group termination.')
+        selected = [target]
+        parents = {}
+        for process in inventory:
+            try:
+                raw = Path(f"/proc/{process['pid']}/stat").read_text()
+                parents[process['pid']] = int(raw[raw.rindex(')') + 2:].split()[1])
+            except FileNotFoundError:
+                continue
+        while True:
+            descendants = [process for process in inventory if process not in selected and
+                           parents.get(process['pid']) in {item['pid'] for item in selected}]
+            if not descendants:
+                break
+            selected.extend(descendants)
+        for signum, grace in ((signal.SIGTERM, 2), (signal.SIGKILL, 1)):
+            if signum == signal.SIGKILL:
+                # A TERM-ignoring supervisor may spawn another child during its
+                # grace window. Its private launch group keeps those orphans owned.
+                for process in self.inventory():
+                    try:
+                        if os.getpgid(process['pid']) == group and process not in selected:
+                            selected.append(process)
+                    except ProcessLookupError:
+                        continue
+                try:
+                    os.killpg(group, signum)
+                except ProcessLookupError:
+                    pass
+            # Parent first; then snapshot survivors, always matching start time.
+            for index, process in enumerate(selected):
+                if process in self.inventory():
+                    try:
+                        os.kill(process['pid'], signum)
+                    except ProcessLookupError:
+                        pass
+                if index == 0:
+                    time.sleep(.1)
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                self.reap()
+                live = self.inventory()
+                for process in live:
+                    try:
+                        if os.getpgid(process['pid']) == group and process not in selected:
+                            selected.append(process)
+                    except ProcessLookupError:
+                        continue
+                if not any(process in live for process in selected):
+                    return 0
+                time.sleep(.02)
+        raise RuntimeError('Process tree termination remains unknown.')
+
     def terminate_children(self):
         for signum, grace in ((signal.SIGTERM, 2), (signal.SIGKILL, 1)):
             for pid in self.children():
@@ -66,10 +144,13 @@ class Runner:
         method = 'natural'
         exit_code = None
         script_path = None
+        session = envelope.get('lifecycle') == 'session'
+        exited_at = None
         try:
+            signal_result = self.terminate_tree(envelope['terminate_process']) if 'terminate_process' in envelope else None
             fd, script_path = tempfile.mkstemp(prefix='workbench-script-', dir='/tmp')
             with os.fdopen(fd, 'wb') as script:
-                script.write(envelope['script'].encode('utf-8'))
+                script.write((f'exit {signal_result}' if signal_result is not None else envelope['script']).encode('utf-8'))
             command = ['bash', '-l' if envelope['login'] else '--noprofile', script_path]
             # No environment from Hermes or the worker daemon is forwarded.
             process = subprocess.Popen(command, cwd='/workspace', env={
@@ -103,6 +184,20 @@ class Runner:
                     # Drain what was produced before termination.
                     self.cancel.clear()
                 ready, _, _ = select.select([process.stdout], [], [], .05)
+                if session and not cancelled and process.poll() is not None:
+                    exited_at = exited_at or time.monotonic()
+                    # Native background wrappers retain the pipe but redirect the
+                    # job's output to a separate log. Foreground capture ends here.
+                    if not ready:
+                        break
+                    if time.monotonic() - exited_at > .5:
+                        # Continuous inherited-pipe output cannot be attributed
+                        # to the exited foreground shell. Never call a bounded
+                        # cutoff complete: stop the environment and reject data.
+                        complete = False
+                        cancelled = True
+                        method = self.terminate_children()
+                        break
                 if ready:
                     data = os.read(process.stdout.fileno(), p.CHUNK_LIMIT)
                     if data:
@@ -116,7 +211,7 @@ class Runner:
                         break
                 elif process.poll() is not None:
                     # A descendant holding stdout is terminated before a receipt.
-                    if self.children():
+                    if self.children() and not session:
                         cancelled = True
                         method = self.terminate_children()
                     else:
@@ -125,10 +220,12 @@ class Runner:
                     break
             exit_code = process.wait(timeout=1)
             process.stdout.close(); writer.join(1)
-            if self.children():
+            if self.children() and (cancelled or not session):
                 cancelled = True
                 method = self.terminate_children()
-            if method is None or self.children():
+            self.reap()
+            detached = self.inventory() if session and not cancelled else []
+            if method is None or ((cancelled or not session) and self.children()):
                 self.emit({'kind': 'unknown', 'operation_id': operation_id})
                 self.stop.set()
                 return
@@ -141,6 +238,12 @@ class Runner:
                        'termination_confirmed': True, 'termination_method': method,
                        'output_complete': complete, 'error_code': None if complete else 'OUTPUT_LIMIT',
                        'worker_elapsed_ms': int((time.monotonic() - started) * 1000)}
+            if session:
+                receipt.update(termination_scope='environment' if cancelled else 'foreground',
+                               detached_processes=detached)
+            # All cleanup and inventory are complete before the worker can send
+            # another command after receiving this receipt.
+            self.active = None
             self.emit({'kind': 'result', 'receipt': p.receipt(receipt)})
         except Exception:
             self.emit({'kind': 'unknown', 'operation_id': operation_id})
@@ -148,10 +251,12 @@ class Runner:
         finally:
             if script_path:
                 Path(script_path).unlink(missing_ok=True)
-            self.active = None
+            if self.active is threading.current_thread():
+                self.active = None
 
     def main(self):
-        self.emit({'kind': 'ready', 'cwd': '/workspace', 'bash': True, 'python': sys.version.split()[0]})
+        self.emit({'kind': 'ready', 'cwd': '/workspace', 'bash': True, 'python': sys.version.split()[0],
+                   'protocol_version': p.VERSION, 'session_lifecycle': 1})
         control_buffer = bytearray()
         while not self.stop.is_set():
             if time.monotonic() - self.last_renewal >= 15:

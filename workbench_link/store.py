@@ -13,7 +13,7 @@ from pathlib import Path
 from .errors import Code, LinkError
 from .protocol import canonical, decode, digest
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SPOOL_LIMIT = 512 * 1024 * 1024
 
 
@@ -56,7 +56,7 @@ class Store:
         self.db = sqlite3.connect(dbpath, isolation_level=None, check_same_thread=False, timeout=2)
         self.db.row_factory = sqlite3.Row
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, SCHEMA_VERSION):
+        if version not in (0, 1, SCHEMA_VERSION):
             self.db.close()
             raise LinkError(Code.UNSUPPORTED_RUNTIME, "Unknown ledger schema; update source without modifying this ledger.")
         self.db.execute("PRAGMA foreign_keys=ON")

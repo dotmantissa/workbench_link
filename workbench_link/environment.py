@@ -3,6 +3,7 @@
 import hashlib
 import os
 import select
+import re
 import subprocess
 import threading
 import time
@@ -118,9 +119,12 @@ class WorkbenchEnvironment(BaseEnvironment):
         p.integer(timeout, 'timeout', 1, p.TIMEOUT_LIMIT)
         self.directory, self.identity = directory, identity
         self.execution_lock = threading.Lock()
+        self.execution_slots = threading.BoundedSemaphore(8)
         self.process_lock = threading.Lock()
         self.current_process = None
         self.closed = False
+        self.process_identities = {}
+        self.termination_target = None
         super().__init__(cwd=cwd, timeout=timeout)
         self.init_session()
         if not self._snapshot_ready:
@@ -138,25 +142,47 @@ class WorkbenchEnvironment(BaseEnvironment):
                    'environment_id': self.identity['environment_id'], 'operation_id': new_id(),
                    'worker_id': self.identity['worker_id'], 'worker_instance_id': self.identity['instance_id'],
                    'project_id': self.identity['project_id'], 'script': cmd_string, 'login': login,
+                   'lifecycle': 'session',
                    'stdin_b64': p.b64((stdin_data or '').encode('utf-8')), 'timeout_seconds': timeout}
+            if self.termination_target:
+                obj['terminate_process'] = self.termination_target
             obj['payload_sha256'] = p.payload_hash(obj)
             self.current_process = LinkProcess(self.directory, p.envelope(obj))
             return self.current_process
 
     def execute(self, command, cwd='', *, timeout=None, stdin_data=None,
                 rewrite_compound_background=True, bounded_capture=False, yield_handler=None):
-        if not self.execution_lock.acquire(blocking=False):
+        if not self.execution_slots.acquire(blocking=False):
+            raise LinkError(Code.WORKSPACE_BUSY, 'Native request queue is full.')
+        if not self.execution_lock.acquire(timeout=30):
+            self.execution_slots.release()
             raise LinkError(Code.WORKSPACE_BUSY, 'Workbench environment is busy. Wait for the active operation receipt.')
         try:
+            # Hermes's public non-local process contract sends this scalar form
+            # for teardown. A shell killing its wrapper alone leaves the job's
+            # children alive; route it to identity-checked container tree control.
+            match = re.fullmatch(r'kill ([0-9]+) 2>/dev/null', command)
+            if not match:
+                match = re.fullmatch(r'pkill -TERM -P ([0-9]+) 2>/dev/null; kill \1 2>/dev/null; true', command)
+            if match:
+                target = self.process_identities.get(int(match[1]))
+                if not target:
+                    raise LinkError(Code.NOT_STARTED, 'Native teardown PID has no recorded environment identity.')
+                self.termination_target = target
             result = super().execute(command, cwd, timeout=timeout, stdin_data=stdin_data,
                 rewrite_compound_background=rewrite_compound_background,
                 bounded_capture=bounded_capture, yield_handler=yield_handler)
             process = self.current_process
+            if process and process.receipt:
+                for identity in process.receipt.get('detached_processes', []):
+                    self.process_identities.setdefault(identity['pid'], identity)
             result['workbench_link'] = {
                 'worker_id': self.identity['worker_id'], 'project_id': self.identity['project_id'],
                 'binding_id': self.identity['binding_id'], 'generation': self.identity['generation'],
                 'operation_id': process.operation_id if process else None,
                 'outcome': process.receipt['terminal_kind'] if process and process.receipt else 'unknown',
+                'termination_scope': process.receipt.get('termination_scope', 'environment') if process and process.receipt else None,
+                'detached_processes': process.receipt.get('detached_processes', []) if process and process.receipt else [],
                 'remote_exit_code': process.receipt['exit_code'] if process and process.receipt else None}
             if process and process.failure:
                 raise process.failure
@@ -169,7 +195,9 @@ class WorkbenchEnvironment(BaseEnvironment):
                 result['output'] = (result.get('output') or '') + '\n[Workbench container stopped; shell state was lost. Start a new session after checking status.]'
             return result
         finally:
+            self.termination_target = None
             self.execution_lock.release()
+            self.execution_slots.release()
 
     def cleanup(self):
         if self.closed:
@@ -180,7 +208,11 @@ class WorkbenchEnvironment(BaseEnvironment):
             process.kill()
             process.done.wait(4)
         try:
-            control.request(self.directory, 'close_environment', environment_id=self.identity['environment_id'])
+            response = control.request(self.directory, 'close_environment', environment_id=self.identity['environment_id'])
+            deadline = time.monotonic() + 8
+            while not response['termination_confirmed'] and time.monotonic() < deadline:
+                time.sleep(.1)
+                response = control.request(self.directory, 'close_environment', environment_id=self.identity['environment_id'])
         except LinkError:
             pass
         if process and process.done.is_set():

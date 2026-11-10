@@ -65,16 +65,68 @@ def native_client(control_dir, decoy):
         call('write_file', {'path': '/workspace/created.txt', 'content': 'worker-created\n'})
         found = call('search_files', {'path': '/workspace', 'pattern': 'worker-created'})
         assert 'created.txt' in json.dumps(found), found
+        code = call('execute_code', {'code': "answer = 41\nprint(answer + 1)"})
+        assert code['status'] == 'success' and code['output'].strip() == '42', code
+        reused = call('execute_code', {'code': "print(answer + 2)"})
+        assert reused['kernel']['reused'] and reused['output'].strip() == '43', reused
+        rpc = call('execute_code', {'code':
+            "from hermes_tools import read_file\nprint(read_file('/workspace/marker.txt'))"})
+        assert rpc['status'] == 'success' and rpc['tool_calls_made'] == 1 and 'WORKER' in rpc['output'], rpc
+        reset = call('execute_code', {'code': "print('answer' in globals())", 'reset': True})
+        assert reset['kernel']['state_reset'] and reset['output'].strip() == 'False', reset
+        call('terminal', {'command': 'cd /workspace'})
+        bg = call('terminal', {'command': "printf 'BACKGROUND\\n'; sleep 3; printf 'FINISHED\\n'", 'background': True})
+        session = bg['session_id']
+        done = call('process_manage', {'action': 'wait', 'session_id': session, 'timeout': 15})
+        assert 'FINISHED' in json.dumps(done), done
+        running = call('terminal', {'command': "trap '' TERM; while true; do printf x >> bg-effects.txt; sleep .1; done", 'background': True})
+        def background_has_effect():
+            result = get_active_env('native-fixture').execute('cat /workspace/bg-effects.txt 2>/dev/null')
+            return result['returncode'] == 0 and result['output'] and set(result['output']) == {'x'}
+        wait_until(background_has_effect)
+        call('process_manage', {'action': 'kill', 'session_id': running['session_id']})
+        env = get_active_env('native-fixture')
+        frozen = env.execute('cat /workspace/bg-effects.txt')['output']
+        time.sleep(.5)
+        assert frozen == env.execute('cat /workspace/bg-effects.txt')['output']
         before = control.request(control_dir, 'status')['operations']
-        for name, arguments in (
-            ('execute_code', {'code': "print('must not run')"}),
-            ('terminal', {'command': 'sleep 30', 'background': True}),
-            ('terminal', {'command': 'sleep 30 &'})):
-            refusal = json.loads(handle_function_call(name, arguments, task_id='native-fixture'))
-            assert 'UNSUPPORTED_RUNTIME' in refusal.get('error', ''), refusal
+        refusal = json.loads(handle_function_call('terminal', {'command': 'sleep 30',
+            'background': True, 'persist_on_release': True}, task_id='native-fixture'))
+        assert 'UNSUPPORTED_RUNTIME' in refusal.get('error', ''), refusal
+        assert before == control.request(control_dir, 'status')['operations']
+        # A second real Hermes process loads a separate profile/configuration;
+        # its missing worker must never borrow this profile's live binding.
+        # The native non-local poller wakes once after a kill before exiting.
+        time.sleep(3)
+        before = control.request(control_dir, 'status')['operations']
+        alternate = home / 'alt'
+        alternate.mkdir()
+        import hermes_yaml as yaml
+        config = yaml.safe_load((home / 'config.yaml').read_text())
+        config['plugins']['entries']['workbench-link']['settings']['control_dir'] = str(home / 'absent')
+        config['plugins']['entries']['workbench-link']['settings']['worker_id'] = 'other'
+        (alternate / 'config.yaml').write_text(yaml.safe_dump(config))
+        shutil.copytree(home / 'plugins', alternate / 'plugins')
+        scoped = subprocess.run([sys.executable, '-c',
+            "import json; from model_tools import handle_function_call; "
+            "r=json.loads(handle_function_call('terminal', {'command':'printf wrong-profile > marker.txt'}, task_id='other')); "
+            "assert 'WORKER_UNAVAILABLE' in r.get('error',''), r; print('profile refusal verified')"],
+            env={**os.environ, 'HERMES_HOME': str(alternate), 'WORKBENCH_LINK_TOKEN': os.urandom(32).hex()},
+            capture_output=True, text=True, timeout=30)
+        assert scoped.returncode == 0, (scoped.stdout, scoped.stderr)
         assert before == control.request(control_dir, 'status')['operations']
         env = get_active_env('native-fixture')
         assert env and not env.uses_host_filesystem
+        before = control.request(control_dir, 'status')['operations']
+        try:
+            control.request(control_dir, 'open_environment')
+        except Exception as exc:
+            assert 'WORKSPACE_BUSY' in str(exc), exc
+        else:
+            raise AssertionError('Second environment was admitted.')
+        assert before == control.request(control_dir, 'status')['operations']
+        missing = json.loads(handle_function_call('read_file', {'path': str(decoy / 'marker.txt')}, task_id='native-fixture'))
+        assert 'SERVER' not in json.dumps(missing) and (missing.get('error') or missing.get('not_found')), missing
         exact = env.execute('cat', stdin_data='字\r\nno newline')
         assert exact['output'] == '字\r\nno newline', exact
         env.execute('mkdir -p nested; cd nested; export WB_TEST_VALUE=retained')
@@ -85,6 +137,13 @@ def native_client(control_dir, decoy):
         env.fetch_file('/workspace/marker.txt', fetched, max_bytes=1024)
         assert fetched.read_bytes() == b'WORKER\n'
         assert env.fetch_realpath('/workspace/marker.txt') == '/workspace/marker.txt'
+        try:
+            env.fetch_file('/workspace/marker.txt', home / 'oversized.txt', max_bytes=2)
+        except Exception:
+            pass
+        else:
+            raise AssertionError('Oversized file transfer returned success.')
+        assert not (home / 'oversized.txt').exists()
         denied = []
 
         def deny(command, description, **kwargs):
@@ -97,6 +156,21 @@ def native_client(control_dir, decoy):
         assert denied and result.get('status') == 'blocked', result
         after = control.request(control_dir, 'status')['operations']
         assert before == after, (before, after)
+        from tools.code_kernel_remote import shutdown_all_remote_kernels
+        shutdown_all_remote_kernels()
+        cleanup_all_environments()
+        closed = control.request(control_dir, 'status')['environments'][0]
+        assert closed['state'] == 'CLOSED' and closed['stop_evidence'], closed
+        # Recreate a clean environment before testing missing-worker refusal.
+        set_approval_callback(None)
+        call('terminal', {'command': 'printf recreated'})
+        timed = json.loads(handle_function_call('terminal', {'command':
+            'while true; do printf x >> timeout-effects.txt; sleep .1; done', 'timeout': 1}, task_id='native-fixture'))
+        assert timed.get('exit_code') in (124, 130) or 'CANCEL_PENDING' in timed.get('error', ''), timed
+        cleanup_all_environments()
+        wait_until(lambda: control.request(control_dir, 'status')['environments'][0]['stop_evidence'])
+        control.request(control_dir, 'reset')
+        call('terminal', {'command': 'printf after-timeout'})
         (home / 'disconnect-request').touch()
         wait_until(lambda: not control.request(control_dir, 'status')['connected'])
         before = control.request(control_dir, 'status')['operations']
@@ -107,7 +181,9 @@ def native_client(control_dir, decoy):
         print(json.dumps({'ok': True, 'native_tools': list(timings), 'timings_ms': timings,
             'approval_denied_before_dispatch': True, 'stdin_exact': True,
             'cwd_env_persisted': True, 'file_fetch_verified': True,
-            'unsupported_code_background_refused_before_dispatch': True,
+            'persistent_code_and_tool_rpc_verified': True, 'background_wait_kill_verified': True,
+            'profile_refusal_verified': True, 'environment_cleanup_confirmed': True,
+            'native_timeout_confirmed': True,
             'disconnect_refused_without_dispatch_or_fallback': True}), flush=True)
     finally:
         from tools.terminal_tool_lifecycle import cleanup_all_environments
@@ -199,7 +275,7 @@ def main():
             monitor.start()
             try:
                 tested = subprocess.run(argv, env=os.environ, text=True, capture_output=True,
-                                        timeout=120, check=False)
+                                        timeout=240, check=False)
                 print(tested.stdout, end='', flush=True)
                 if tested.returncode:
                     print(tested.stderr, file=sys.stderr)

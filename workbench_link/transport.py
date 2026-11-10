@@ -2,6 +2,8 @@
 
 import http.client
 import ssl
+import socket
+import threading
 from urllib.parse import urlsplit
 
 from . import auth, protocol as p
@@ -27,6 +29,20 @@ class WorkerClient:
         constructor = http.client.HTTPSConnection if self.url.scheme == 'https' else http.client.HTTPConnection
         options = {'context': self.context} if self.url.scheme == 'https' else {}
         connection = constructor(self.url.hostname, self.url.port, timeout=3, **options)
+        expired = threading.Event()
+
+        def abort():
+            expired.set()
+            sock = connection.sock
+            if sock:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            connection.close()
+        timer = threading.Timer(3, abort)
+        timer.daemon = True
+        timer.start()
         try:
             # http.client uses no environment proxy settings or redirect machinery.
             connection.request('POST', path, body, headers)
@@ -34,10 +50,15 @@ class WorkerClient:
             if 300 <= response.status < 400:
                 raise LinkError(Code.AUTH_FAILED, 'Broker redirects are refused.')
             raw = response.read(p.WIRE_LIMIT + 1)
+            if expired.is_set():
+                raise LinkError(Code.WORKER_UNAVAILABLE, 'Broker response deadline exceeded; reconcile without replay.')
             result = p.decode(raw)
+        except ssl.SSLCertVerificationError:
+            raise LinkError(Code.AUTH_FAILED, 'Broker TLS identity could not be verified. Check hostname and trusted CA.') from None
         except (OSError, http.client.HTTPException):
             raise LinkError(Code.WORKER_UNAVAILABLE, 'Broker transport is unavailable; reconcile using the same operation IDs.') from None
         finally:
+            timer.cancel()
             connection.close()
         if response.status != 200 or result.get('ok') is not True:
             try:

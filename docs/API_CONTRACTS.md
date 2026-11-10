@@ -1,6 +1,6 @@
 # Hermes compatibility: evidence and integration gates
 
-Baseline inspected: released tag **v0.23.0**, published November 5, 2026. The November 10 [runtime evidence](RUNTIME_EVIDENCE.md) now proves native foreground/file routing, approvals and disconnected refusal. Persistent `execute_code` and background/concurrent RPC remain a demonstrated unresolved contract. Rows below preserve the complete integration targets.
+Baseline inspected: released tag **v0.23.0**, published November 5, 2026. The November 10 [runtime evidence](RUNTIME_EVIDENCE.md) proves native file/terminal routing, persistent code kernels with concurrent RPC, tracked background jobs, approvals, profile refusal and confirmed cleanup. Rows below explain the public integration seams.
 
 | Surface | Source-verified behavior | Implementation consequence |
 |---|---|---|
@@ -34,7 +34,7 @@ Baseline inspected: released tag **v0.23.0**, published November 5, 2026. The No
 
 Core factory and built-in Docker source were read to understand behavior, not selected as imports or code to fork. New source snapshots and SHA-256 hashes are in ignored `research/sources/architecture-fetch-manifest.json`. Developer evidence must record the resolved release commit before executing the integration fixture.
 
-## Unresolved runtime contracts
+## Extended contracts and evidence boundaries
 
 1. Real namespaced directory import and relative package imports; no duplicate pip discovery.
 2. Cached/provider creation and shell initialization call order, including prompt-time probes.
@@ -47,3 +47,5 @@ Core factory and built-in Docker source were read to understand behavior, not se
 9. Doctor/validate's declared-provider/CLI/command metadata requirements and scanner treatment of documented subclass seams.
 
 Any unsupported seam is a reason to change scope or request an upstream hook. It is not permission to monkey-patch core, private registries or gateway authentication. The broker avoids the previously uncertain gateway worker-auth route entirely by owning its separate transport.
+
+The initial foreground/kernel mismatch is resolved by session-scoped receipts and environment-owned processes. Scalar native process teardown and the pinned kernel teardown command route to identity-checked process-tree control. Gateway multiplexing, delegated environment isolation and physical remote deployment remain outside the verified release scope.

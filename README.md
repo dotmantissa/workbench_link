@@ -1,8 +1,8 @@
 # Workbench Link
 
-Workbench Link routes Hermes's native file tools and foreground terminal commands to one explicitly selected project on a Linux Docker worker. The worker connects outbound to a profile-owned broker; Hermes never selects a new local directory remotely.
+Workbench Link routes Hermes's native file, terminal and code tools to one explicitly selected project on a Linux Docker worker. The worker connects outbound to a profile-owned broker; Hermes never selects a new local directory remotely.
 
-**Experimental implementation checkpoint.** Native `read_file`, `patch`, `write_file`, `search_files` and foreground `terminal` are tested with Hermes v0.23.0. `execute_code` and background terminal jobs are explicitly refused: Hermes's persistent remote kernel needs background processes and concurrent file RPC that this implementation does not support yet. Full release gates remain open.
+**Version 0.1.0, verified with Hermes v0.23.0.** Native read/edit/test, persistent `execute_code` with tool RPC, and tracked background jobs run in the selected worker container. Receipts, process ownership and confirmed cleanup are tested in an isolated local topology. See the [measured evidence](docs/RUNTIME_EVIDENCE.md) for the tested scope.
 
 There is no frontend or replacement shell/file toolset. Management uses `hermes workbench-link`; `/workbench-link` shows the current profile binding. Registration starts no services.
 
@@ -82,17 +82,19 @@ hermes workbench-link status
 
 Start a new Hermes session in that profile. Use its native tools to read a file, patch a bug and run project tests with a foreground command such as `python test_project.py`. Normal Hermes approvals still apply. A denial creates no worker operation.
 
-Plain HTTP requires explicit `--local-test` on both processes and loopback addresses. For a remote broker, use `https://` with a trusted certificate: `serve` accepts `--tls-cert` and `--tls-key`, and the worker accepts `--ca-file`. This remote TLS topology has not yet been exercised in the integration suite.
+Plain HTTP requires explicit `--local-test` on both processes and loopback addresses. For a remote broker, use `https://` with a trusted certificate: `serve` accepts `--tls-cert` and `--tls-key`, and the worker accepts `--ca-file`. Certificate trust, hostname checks and handshake capacity are tested locally. Physical two-machine deployment and WAN behavior remain unmeasured.
 
 ## State and limitations
 
 The broker keeps durable grants, output chunks, cancellation intentions and receipts. Duplicate delivery uses the same operation identity. Known shell exit failures stay shell failures. Missing termination evidence becomes `OUTCOME_UNKNOWN` and fences the binding; a new operation ID cannot bypass it. Cancellation does not undo project edits.
 
-Stop the foreground worker and broker with Ctrl-C. The in-container watchdog stops remaining children after lease loss. Timeout/cancellation can destroy scratch and shell state; the native adapter reports that loss. After an uncertain operation, inspect `status --json` and preserve the state directories. Human resolution/reset commands are not implemented yet; reconnecting or restarting does not clear a fence. `doctor` currently reports the same connection/binding status as `status`.
+Use `hermes workbench-link stop` to request environment cleanup; keep the broker and worker running until stopped evidence arrives. `reset` requires stopped environments and reconciled outcomes, then creates a new generation. Start a new Hermes session after reset or container loss. Ctrl-C shuts down each foreground service; the container watchdog stops children on lease loss. Cancellation does not undo project edits.
+
+Inspect uncertainty with `operations --json`, `inspect OPERATION_UUID --json` and `recover --json`. Recover reads receipts and never replays a command or clears a fence. For an irreducible `UNKNOWN`, restart the same worker state to stop recorded containers, inspect the project locally, then run `resolve OPERATION_UUID --note 'Your inspection findings'` from a human terminal. It requires typing the complete operation ID and preserves unknown history. After reconciliation, run `reset`; if the worker restarted, bind its new printed instance. `inspect OPERATION_UUID --output` explicitly writes retained output bytes to stdout.
 
 Project contents, command scripts, stdin and returned output are disclosed to Hermes and stored in private worker/broker state. Secrets already inside the selected project remain readable by commands. The watchdog is a failure-control mechanism for trusted project execution, not an isolation guarantee against hostile code running as the same container user.
 
-Gateway concurrency, delegated/multiple environments, persistent `execute_code`, background jobs, automatic file sync, Windows/macOS workers, output-quota exhaustion and operator fence resolution remain release gates. The repository is not yet published in the Hermes catalog.
+Supported scope is one foreground CLI session and environment per profile. Additional environments are refused. Gateway multiplexing, delegated workspace isolation, PTY/interactive background stdin, jobs that outlive environment closure (`persist_on_release`), automatic file sync and Windows/macOS workers are outside this release. Native background log/poll/wait/kill work through Hermes's existing process tools. Output is capped at 16 MiB per operation; incomplete output fails instead of becoming successful file data. Private spools have a 512 MiB quota and are retained until operator maintenance; automatic timed deletion is not implemented. Preserve unresolved state. The repository is not yet listed in the Hermes catalog.
 
 ## Reproduce the checks
 
@@ -111,8 +113,13 @@ HERMES_RUNTIME_DIR="$PWD/dev/runtime/hermes-home" \
   tests/integration/native_smoke.py \
   --hermes-source "$PWD/dev/hermes" \
   --image sha256:YOUR_INSPECTED_IMAGE_ID
+
+HERMES_HOME="$PWD/dev/runtime/hermes-home" \
+HERMES_RUNTIME_DIR="$PWD/dev/runtime/hermes-home" \
+  "$PWD/dev/hermes/scripts/run-in-hermes-env" python \
+  tests/integration/install_smoke.py --hermes-source "$PWD/dev/hermes"
 ```
 
-This development harness expects the source/runtime under this checkout's ignored `dev/` tree. It runs Hermes in a separate container with a server decoy, profile and private control socket, and no selected-project mount or Docker socket. The broker and project worker run outside it on the same local machine. It checks native routing, approval denial, file extraction, shell state, explicit unsupported calls and disconnected refusal. This is not a physical two-machine reliability test.
+This development harness expects the source/runtime under this checkout's ignored `dev/` tree. It runs Hermes in a separate container with a server decoy, profile and private control socket, and no selected-project mount or Docker socket. The broker and project worker run outside it on the same local machine. It checks native routing, approval denial, file extraction, shell state, persistent kernels, background lifecycle, profile refusal, confirmed cleanup and disconnected refusal. The install harness checks a fresh dedicated profile using the already installed disposable Hermes runtime. This is not a physical two-machine reliability test.
 
-See [runtime evidence](docs/RUNTIME_EVIDENCE.md), [architecture](ARCHITECTURE.md), [implementation/release gates](docs/IMPLEMENTATION.md), [protocol](docs/PROTOCOL.md) and [product scope](PRODUCT.md). [Operations](docs/OPERATIONS.md) preserves the broader intended interface; commands beyond those shown here remain planned. [Direction and demand](DIRECTION_DECISION.md) and [sources](SOURCES.md) record the research behind the project.
+See [runtime evidence](docs/RUNTIME_EVIDENCE.md), [architecture](ARCHITECTURE.md), [implementation/release gates](docs/IMPLEMENTATION.md), [protocol](docs/PROTOCOL.md) and [product scope](PRODUCT.md). [Operations](docs/OPERATIONS.md) documents the implemented management and recovery commands. [Direction and demand](DIRECTION_DECISION.md) and [sources](SOURCES.md) record the research behind the project.
